@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>PDF Upload Test</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; background: #1a1a1a; color: #fff; }
+    .upload-zone { border: 2px dashed #4A90FF; padding: 40px; text-align: center; cursor: pointer; }
+    .upload-zone:hover { background: #2a2a2a; }
+    #result { margin-top: 20px; padding: 20px; background: #2a2a2a; border-radius: 8px; }
+    .error { color: #EF5350; }
+    .success { color: #4CAF50; }
+  </style>
+</head>
+<body>
+  <h1>PDF Upload Test</h1>
+  <div class="upload-zone" onclick="document.getElementById('fileInput').click()">
+    <p>Click or drag PDF here</p>
+    <input type="file" id="fileInput" accept=".pdf" style="display:none">
+  </div>
+  <div id="result"></div>
+
+  <script type="module">
+    import * as pdfjsLib from 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.9.261/+esm';
+    
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.9.261/build/pdf.worker.min.mjs';
+
+    const input = document.getElementById('fileInput');
+    const result = document.getElementById('result');
+
+    input.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      result.innerHTML = '<p>Processing...</p>';
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        
+        let text = '';
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const content = await page.getTextContent();
+          const pageText = content.items.map(item => item.str).join(' ');
+          text += pageText + '\n\n';
+        }
+
+        result.innerHTML = `
+          <p class="success">✅ Success!</p>
+          <p>File: ${file.name}</p>
+          <p>Pages: ${pdf.numPages}</p>
+          <p>Text length: ${text.length} characters</p>
+          <details>
+            <summary>First 500 characters:</summary>
+            <pre>${text.substring(0, 500)}</pre>
+          </details>
+        `;
+      } catch (err) {
+        result.innerHTML = `
+          <p class="error">❌ Error: ${err.message}</p>
+          <pre>${err.stack}</pre>
+        `;
+      }
+    });
+  </script>
+</body>
+</html>

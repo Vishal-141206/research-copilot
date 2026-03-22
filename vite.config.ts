@@ -77,4 +77,23 @@ export default defineConfig({
     // (needed for automatic WASM file discovery at ../../wasm/).
     exclude: ['@runanywhere/web-llamacpp', '@runanywhere/web-onnx'],
   },
+  build: {
+    sourcemap: false,
+    rollupOptions: {
+      onwarn(warning, warn) {
+        if (warning.code === 'SOURCEMAP_ERROR') return;
+        warn(warning);
+      },
+      output: {
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom'],
+          'vendor-pdf': ['pdfjs-dist'],
+        },
+        sourcemapExcludeSources: true,
+      },
+    },
+  },
+  // Suppress sourcemap warnings in dev mode
+  logLevel: 'warn',
+  clearScreen: false,
 });
