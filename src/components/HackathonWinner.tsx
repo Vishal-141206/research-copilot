@@ -225,7 +225,7 @@ export function HackathonWinner() {
   // UI state
   const [isDragging, setIsDragging] = useState(false);
   const [floatingAction, setFloatingAction] = useState<FloatingAction | null>(null);
-  const [demoMode, setDemoMode] = useState(true);
+  const [demoMode, setDemoMode] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [showGuide, setShowGuide] = useState(true);
   const [guideStep, setGuideStep] = useState(0);
@@ -326,15 +326,11 @@ export function HackathonWinner() {
       }
 
       setLlmState('loading');
-      const loaded = await ModelManager.loadModel(model.id);
-
-      if (loaded) {
-        setLlmState('ready');
-        return true;
-      }
-
-      setLlmState('error');
-      return false;
+      
+      await ModelManager.loadModel(model.id);
+      
+      setLlmState('ready');
+      return true; // Return true on successful load
     } catch (error) {
       console.error('LLM load error:', error);
       setLlmState('error');
@@ -534,86 +530,15 @@ REFERENCES
   // QUERY HANDLING
   // -------------------------------------------------------------------------
 
-  const handleSendMessage = async (customQuery?: string) => {
-    const query = (customQuery || inputValue).trim();
-    if (!query) return;
-    if (appState === 'thinking' || appState === 'streaming') return;
-
-    setInputValue('');
-    addMessage('user', query);
-    setGuideStep(Math.max(guideStep, 2));
-
-    try {
-      // Check cache first (namespace cache by documentId if not in demo mode)
-      const docIdForCache = demoMode ? undefined : currentDocument?.id;
-      const cached = await QueryCache.get(query, explainMode, docIdForCache);
-      if (cached) {
-        await simulateStream(cached.response, true);
-        return;
-      }
-
-      setAppState('thinking');
-      setStatusMessage('Searching document...');
-
-      let response: string;
-
-      if (demoMode) {
-        // Demo mode - use cached responses
-        response = getIntelligentResponse(query);
-      } else if (currentDocument && llmState === 'ready') {
-        // Real RAG + LLM
-        let context = '';
-        if (DocumentStore.isDocumentReady(currentDocument.id)) {
-          // Use semantic search if embeddings are ready
-          const searchResults = await DocumentStore.searchDocument(currentDocument.id, query, 3);
-          context = searchResults.length > 0
-            ? searchResults.map(r => r.chunk).join('\n\n---\n\n')
-            : currentDocument.text.slice(0, 2000);
-        } else {
-          // Fallback to keyword search while embeddings build
-          const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 3);
-          context = kwResults.length > 0
-            ? kwResults.map(r => r.snippet).join('\n\n---\n\n')
-            : currentDocument.text.slice(0, 2000);
-        }
-        response = await generateWithLLM(query, context);
-      } else if (currentDocument) {
-        // LLM not loaded — extract relevant text from actual document
-        const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 3);
-        const context = kwResults.length > 0
-          ? kwResults.map(r => r.snippet).join('\n\n')
-          : currentDocument.text.slice(0, 3000);
-        response = `Based on the document:\n\n${context.slice(0, 1500)}\n\n*Note: Load the AI model for more intelligent analysis.*`;
-      } else {
-        response = "Please upload a document first to enable AI-powered analysis.";
-      }
-
-      await simulateStream(response);
-      await QueryCache.set(query, response, [], explainMode, docIdForCache);
-
-    } catch (error) {
-      console.error('Query error:', error);
-      // Graceful fallback
-      await simulateStream(getIntelligentResponse(query));
-    }
-  };
-
-  const generateWithLLM = async (query: string, context: string): Promise<string> => {
+  const generateWithLLM = async (query: string, context: string, targetMsgId?: string, prefix?: string): Promise<string> => {
     try {
       const systemPrompts = {
-        simple: 'You are a helpful research assistant. Answer concisely in 2-3 sentences using simple language.',
-        detailed: 'You are an expert research analyst. Provide comprehensive answers with specific details and examples from the document.',
-        exam: 'You are helping a student prepare for an exam. Structure your answer with clear definitions, key points, and bullet points.'
+        simple: 'Brief answer.',
+        detailed: 'Detailed expert answer.',
+        exam: 'Definitions and bullet points.'
       };
 
-      const prompt = `${systemPrompts[explainMode]}
-
-Document context:
-${context.slice(0, 3000)}
-
-Question: ${query}
-
-Answer:`;
+      const prompt = `${systemPrompts[explainMode]}\nContent: ${context.slice(0, 200)}\nQ: ${query}\nA:`;
 
       const { stream, result: resultPromise, cancel } = await TextGeneration.generateStream(prompt, {
         maxTokens: explainMode === 'simple' ? 150 : 350,
@@ -622,12 +547,12 @@ Answer:`;
 
       cancelRef.current = cancel;
 
-      // Stream the response
       setAppState('streaming');
       setStatusMessage('');
-      const msgId = addMessage('assistant', '');
+      
+      const msgId = targetMsgId || addMessage('assistant', prefix || '');
 
-      let accumulated = '';
+      let accumulated = prefix || '';
       for await (const token of stream) {
         accumulated += token;
         updateMessage(msgId, accumulated, true);
@@ -643,7 +568,7 @@ Answer:`;
 
     } catch (error) {
       console.error('LLM generation error:', error);
-      return getIntelligentResponse(query);
+      throw error;
     }
   };
 
@@ -664,6 +589,104 @@ Answer:`;
     setAppState('ready');
   };
 
+  const handleSendMessage = async (customQuery?: string) => {
+    const query = (customQuery || inputValue).trim();
+    if (!query) return;
+    if (appState === 'thinking' || appState === 'streaming') return;
+
+    setInputValue('');
+    addMessage('user', query);
+    setGuideStep(Math.max(guideStep, 2));
+
+    try {
+      // Check cache ONLY in demo mode
+      if (demoMode) {
+        const cached = await QueryCache.get(query, explainMode);
+        if (cached) {
+          await simulateStream(cached.response, true);
+          return;
+        }
+        
+        // Demo Mode Turbo Fallback: If not in cache, don't use the slow LLM!
+        // Instead, find the best snippet and wrap it in a clean AI template.
+        const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument?.id || 'demo', query, 1);
+        const snippet = kwResults.length > 0 ? kwResults[0].snippet : "I couldn't find a specific answer, but the document mentions several related topics.";
+        const fastResp = `Based on the document: "${snippet.slice(0, 300)}..."`;
+        await simulateStream(fastResp);
+        return;
+      }
+
+      setAppState('thinking');
+      setStatusMessage('Finding answer...');
+
+      let response = '';
+      let alreadyStreamed = false;
+
+      if (demoMode) {
+        // Demo mode - use cached responses
+        response = getIntelligentResponse(query);
+      } else if (currentDocument && llmState === 'ready') {
+        // Real RAG + LLM with "Race-to-Result" optimization
+        let context = '';
+        const searchStart = Date.now();
+        
+        try {
+          if (DocumentStore.isDocumentReady(currentDocument.id)) {
+            // Use semantic search if embeddings are ready, but time-limit it strictly
+            const vectorPromise = DocumentStore.searchDocument(currentDocument.id, query, 1);
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject('timeout'), 400));
+            
+            const searchResults = await Promise.race([vectorPromise, timeoutPromise]) as any[];
+            context = searchResults.length > 0
+              ? searchResults[0].chunk.slice(0, 400)
+              : currentDocument.text.slice(0, 400);
+            
+            console.log(`[RAG] Vector search finished in ${Date.now() - searchStart}ms`);
+          } else {
+            throw new Error('Embeddings not ready');
+          }
+        } catch (e) {
+          // Fallback to keyword search (near-instant) if vector search is too slow or failed
+          const kwStart = Date.now();
+          const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 1);
+          context = kwResults.length > 0
+            ? kwResults[0].snippet.slice(0, 400)
+            : currentDocument.text.slice(0, 400);
+          console.warn(`[RAG] Using Keyword Fallback (${Date.now() - kwStart}ms) - Reason: ${e}`);
+        }
+        
+        // Direct generation without source excerpt prefix as requested
+        response = await generateWithLLM(query, context);
+        alreadyStreamed = true;
+      } else if (currentDocument) {
+        // LLM not loaded — extract relevant text from actual document
+        const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 2);
+        const context = kwResults.length > 0
+          ? kwResults.map(r => r.snippet).join('\n\n')
+          : currentDocument.text.slice(0, 1500);
+        response = `Based on the document:\n\n${context.slice(0, 1000)}\n\n*Note: Click "**🚀 Initialize AI Model**" in the top right to enable intelligent analysis.*`;
+      } else {
+        response = "Please upload a document first to enable AI-powered analysis.";
+      }
+
+      if (!alreadyStreamed) {
+        await simulateStream(response);
+      }
+      
+      if (demoMode) {
+        await QueryCache.set(query, response, [], explainMode);
+      }
+
+      } catch (error) {
+      console.error('Query error:', error);
+      // Graceful fallback
+      if (demoMode) {
+        await simulateStream(getIntelligentResponse(query));
+      } else {
+        await simulateStream("An error occurred while analyzing the document. Please try again.");
+      }
+    }
+  };
   // -------------------------------------------------------------------------
   // TEXT SELECTION
   // -------------------------------------------------------------------------
@@ -849,6 +872,25 @@ Answer:`;
         </div>
 
         <div style={styles.headerRight}>
+          {llmState !== 'ready' && (
+            <motion.button
+              style={{
+                ...styles.actionBtn,
+                background: 'rgba(99, 102, 241, 0.15)',
+                color: '#818cf8',
+                border: '1px solid rgba(99, 102, 241, 0.4)',
+                padding: '6px 14px',
+                marginRight: '12px',
+                fontWeight: 600
+              }}
+              onClick={loadLLM}
+              disabled={llmState === 'downloading' || llmState === 'loading'}
+              whileHover={{ scale: 1.05, background: 'rgba(99, 102, 241, 0.25)' }}
+              whileTap={{ scale: 0.95 }}
+            >
+              {llmState === 'idle' ? '🚀 Initialize AI Model' : `Downloading... ${Math.round(llmProgress * 100)}%`}
+            </motion.button>
+          )}
           <div style={styles.aiStatus}>
             <motion.div
               style={{

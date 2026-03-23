@@ -5,7 +5,8 @@
 
 import * as pdfjsLib from 'pdfjs-dist';
 import { chunkText } from './pdfProcessor';
-import { generateEmbeddings, searchSimilarChunks, SearchResult } from './embeddings';
+import { cosineSimilarity, SearchResult } from './embeddings';
+import { workerManager } from '../workers/workerManager';
 
 // Configure PDF.js worker with CDN for reliability
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
@@ -116,9 +117,15 @@ class DocumentStoreClass {
     const chunks = chunkText(doc.text, 800, 75);
     doc.chunks = chunks;
 
-    // Generate embeddings
-    if (onProgress) onProgress('Generating embeddings...', 0.4);
-    const embeddings = await generateEmbeddings(chunks, (current, total) => {
+    // Initialize worker if needed
+    if (onProgress) onProgress('Initializing embedding model...', 0.35);
+    await workerManager.initEmbeddings((prog) => {
+      if (onProgress) onProgress(`Loading model: ${prog.status}`, 0.35 + (prog.progress || 0) * 0.05);
+    });
+
+    // Generate embeddings in a separate non-blocking thread
+    if (onProgress) onProgress('Generating embeddings in background...', 0.4);
+    const embeddings = await workerManager.generateEmbeddings(chunks, (current, total) => {
       if (onProgress) {
         const progress = 0.4 + (current / total) * 0.6;
         onProgress(`Generating embeddings (${current}/${total})...`, progress);
@@ -147,7 +154,24 @@ class DocumentStoreClass {
       throw new Error('Document not processed for RAG. Call processDocumentForRAG first.');
     }
 
-    return searchSimilarChunks(query, doc.chunks, doc.embeddings, topK);
+    // Generate query embedding in background worker to completely avoid freezing the UI
+    const queryEmbedding = await workerManager.generateEmbedding(query);
+
+    // Calculate similarities in main thread (fast since it's just math on a few hundred small arrays)
+    const results: SearchResult[] = [];
+    for (let i = 0; i < doc.chunks.length; i++) {
+      const similarity = cosineSimilarity(queryEmbedding, doc.embeddings[i]);
+      results.push({
+        chunkIndex: i,
+        chunk: doc.chunks[i],
+        similarity,
+      });
+    }
+
+    // Sort descending by similarity and take top K
+    return results
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, topK);
   }
 
   /**

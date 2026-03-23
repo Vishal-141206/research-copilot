@@ -42,6 +42,7 @@ async function initEmbeddings() {
       'feature-extraction',
       'Xenova/all-MiniLM-L6-v2',
       {
+        quantized: true,
         progress_callback: (progress: any) => {
           self.postMessage({ 
             type: 'progress', 

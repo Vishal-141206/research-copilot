@@ -17,7 +17,8 @@ interface WorkerProgress {
 }
 
 class WorkerManager {
-  private embeddingsWorker: Worker | null = null;
+  private priorityEmbedWorker: Worker | null = null;
+  private backgroundEmbedWorker: Worker | null = null;
   private whisperWorker: Worker | null = null;
   
   private embeddingsStatus: WorkerStatus = 'idle';
@@ -45,46 +46,56 @@ class WorkerManager {
       });
     }
 
-    this.embeddingsStatus = 'loading';
-    
     return new Promise((resolve, reject) => {
-      this.embeddingsWorker = new EmbeddingsWorker();
+      // Initialize two workers: One for priority (User Queries) and one for Background (PDF indexing)
+      // This prevents the search being blocked by document ingestion!
+      this.priorityEmbedWorker = new EmbeddingsWorker();
+      this.backgroundEmbedWorker = new EmbeddingsWorker();
       
-      const messageHandler = (e: MessageEvent) => {
+      let priorityReady = false;
+      let backgroundReady = false;
+
+      const priorityHandler = (e: MessageEvent) => {
         const { type, ...data } = e.data;
-        
-        switch (type) {
-          case 'ready':
+        if (type === 'ready') {
+          priorityReady = true;
+          // Only start background init once priority is ready to avoid contention
+          this.backgroundEmbedWorker!.postMessage({ type: 'init' });
+          if (backgroundReady) {
             this.embeddingsStatus = 'ready';
             resolve();
-            break;
-            
-          case 'progress':
-            if (onProgress) {
-              onProgress({ status: data.status, progress: data.progress });
-            }
-            break;
-            
-          case 'error':
-            this.embeddingsStatus = 'error';
-            reject(new Error(data.error));
-            break;
-            
-          case 'embedResult':
-          case 'embedBatchResult':
-          case 'batchProgress':
-            this.handleWorkerMessage(e.data);
-            break;
+          }
+        } else if (type === 'progress') {
+          if (onProgress) onProgress({ status: `Priority: ${data.status}`, progress: data.progress });
+        } else if (type === 'error') {
+          this.embeddingsStatus = 'error';
+          reject(new Error(data.error));
+        } else {
+          this.handleWorkerMessage(e.data);
+        }
+      };
+
+      const backgroundHandler = (e: MessageEvent) => {
+        const { type, ...data } = e.data;
+        if (type === 'ready') {
+          backgroundReady = true;
+          if (priorityReady) {
+            this.embeddingsStatus = 'ready';
+            resolve();
+          }
+        } else if (type === 'progress') {
+          // Progress for background is less critical to main thread
+        } else if (type === 'error') {
+          console.warn('Background worker error:', data.error);
+        } else {
+          this.handleWorkerMessage(e.data);
         }
       };
       
-      this.embeddingsWorker.onmessage = messageHandler;
-      this.embeddingsWorker.onerror = (error) => {
-        this.embeddingsStatus = 'error';
-        reject(error);
-      };
+      this.priorityEmbedWorker.onmessage = priorityHandler;
+      this.backgroundEmbedWorker.onmessage = backgroundHandler;
       
-      this.embeddingsWorker.postMessage({ type: 'init' });
+      this.priorityEmbedWorker.postMessage({ type: 'init' });
     });
   }
 
@@ -145,15 +156,15 @@ class WorkerManager {
 
   // Generate single embedding
   async generateEmbedding(text: string): Promise<number[]> {
-    if (!this.embeddingsWorker || this.embeddingsStatus !== 'ready') {
-      throw new Error('Embeddings worker not ready');
+    if (!this.priorityEmbedWorker || this.embeddingsStatus !== 'ready') {
+      throw new Error('Priority embeddings worker not ready');
     }
 
     const id = `embed_${this.messageId++}`;
     
     return new Promise((resolve, reject) => {
       this.pendingRequests.set(id, { resolve, reject });
-      this.embeddingsWorker!.postMessage({ type: 'embed', id, text });
+      this.priorityEmbedWorker!.postMessage({ type: 'embed', id, text });
       
       // Timeout after 30 seconds
       setTimeout(() => {
@@ -165,13 +176,13 @@ class WorkerManager {
     });
   }
 
-  // Generate batch embeddings
+  // Generate batch embeddings (USES BACKGROUND WORKER)
   async generateEmbeddings(
     texts: string[],
     onProgress?: (current: number, total: number) => void
   ): Promise<number[][]> {
-    if (!this.embeddingsWorker || this.embeddingsStatus !== 'ready') {
-      throw new Error('Embeddings worker not ready');
+    if (!this.backgroundEmbedWorker || this.embeddingsStatus !== 'ready') {
+      throw new Error('Background embeddings worker not ready');
     }
 
     const id = `embedBatch_${this.messageId++}`;
@@ -186,7 +197,7 @@ class WorkerManager {
     
     return new Promise((resolve, reject) => {
       this.pendingRequests.set(id, { resolve, reject });
-      this.embeddingsWorker!.postMessage({ type: 'embedBatch', id, texts });
+      this.backgroundEmbedWorker!.postMessage({ type: 'embedBatch', id, texts });
       
       // Timeout based on batch size (10s per text)
       setTimeout(() => {
@@ -264,7 +275,8 @@ class WorkerManager {
 
   // Terminate workers
   terminate() {
-    this.embeddingsWorker?.terminate();
+    this.priorityEmbedWorker?.terminate();
+    this.backgroundEmbedWorker?.terminate();
     this.whisperWorker?.terminate();
     this.embeddingsStatus = 'idle';
     this.whisperStatus = 'idle';
