@@ -113,7 +113,7 @@ class DocumentStoreClass {
 
     // Chunk the text
     if (onProgress) onProgress('Chunking document...', 0.3);
-    const chunks = chunkText(doc.text, 500, 50);
+    const chunks = chunkText(doc.text, 800, 75);
     doc.chunks = chunks;
 
     // Generate embeddings
@@ -179,10 +179,43 @@ class DocumentStoreClass {
   }
 
   /**
-   * Search for relevant text snippets in documents
+   * Search for relevant text snippets in a SPECIFIC document
    * Simple keyword-based search for RAG context
    */
-  searchDocuments(query: string, maxSnippets: number = 3): Array<{ doc: Document; snippet: string }> {
+  searchDocumentByKeyword(docId: string, query: string, maxSnippets: number = 3): Array<{ snippet: string }> {
+    const doc = this.documents.get(docId);
+    if (!doc) return [];
+
+    const keywords = query.toLowerCase().split(/\s+/).filter(k => k.length > 3);
+    if (keywords.length === 0) return [];
+
+    const results: Array<{ snippet: string; score: number }> = [];
+    const text = doc.text.toLowerCase();
+    
+    const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+    
+    for (const sentence of sentences) {
+      let score = 0;
+      for (const keyword of keywords) {
+        if (sentence.includes(keyword)) score += 1;
+      }
+      
+      if (score > 0) {
+        results.push({ snippet: sentence.trim(), score });
+      }
+    }
+
+    return results
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxSnippets)
+      .map(({ snippet }) => ({ snippet }));
+  }
+
+  /**
+   * Search for relevant text snippets across ALL documents
+   * Used by ResearchChatTab
+   */
+  searchAllDocuments(query: string, maxSnippets: number = 3): Array<{ doc: Document; snippet: string }> {
     const keywords = query.toLowerCase().split(/\s+/).filter(k => k.length > 3);
     if (keywords.length === 0) return [];
 
@@ -191,7 +224,6 @@ class DocumentStoreClass {
     for (const doc of this.documents.values()) {
       const text = doc.text.toLowerCase();
       
-      // Count keyword matches
       let score = 0;
       for (const keyword of keywords) {
         const matches = (text.match(new RegExp(keyword, 'g')) || []).length;
@@ -199,7 +231,6 @@ class DocumentStoreClass {
       }
 
       if (score > 0) {
-        // Extract snippet around first keyword match
         const firstKeyword = keywords[0];
         const index = text.indexOf(firstKeyword);
         const start = Math.max(0, index - 200);
@@ -210,7 +241,6 @@ class DocumentStoreClass {
       }
     }
 
-    // Sort by score and return top results
     return results
       .sort((a, b) => b.score - a.score)
       .slice(0, maxSnippets)

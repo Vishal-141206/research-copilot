@@ -38,13 +38,13 @@ class QueryCacheClass {
     return query.toLowerCase().trim().replace(/\s+/g, ' ');
   }
 
-  async get(query: string, mode?: string): Promise<CachedQuery | null> {
-    const key = this.normalizeQuery(query) + (mode ? `-${mode}` : '');
+  async get(query: string, mode?: string, documentId?: string): Promise<CachedQuery | null> {
+    const key = this.normalizeQuery(query) + (mode ? `-${mode}` : '') + (documentId ? `-${documentId}` : '');
     return this.cache.get(key) || null;
   }
 
-  async set(query: string, response: string, context?: string[], mode?: string) {
-    const key = this.normalizeQuery(query) + (mode ? `-${mode}` : '');
+  async set(query: string, response: string, context?: string[], mode?: string, documentId?: string) {
+    const key = this.normalizeQuery(query) + (mode ? `-${mode}` : '') + (documentId ? `-${documentId}` : '');
     const cached: CachedQuery = {
       query,
       response,

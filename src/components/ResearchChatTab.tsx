@@ -69,7 +69,7 @@ export function ResearchChatTab() {
       return { prompt: userQuery, sources: [] };
     }
 
-    const searchResults = DocumentStore.searchDocuments(userQuery, 2);
+    const searchResults = DocumentStore.searchAllDocuments(userQuery, 2);
     
     if (searchResults.length === 0) {
       // No relevant snippets, just mention available documents

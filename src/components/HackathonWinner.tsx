@@ -16,7 +16,7 @@ import { TextGeneration } from '@runanywhere/web-llamacpp';
 import { STT } from '@runanywhere/web-onnx';
 import { DocumentStore, Document as StoredDoc } from '../utils/documentStore';
 import { QueryCache } from '../utils/queryCache';
-import { getDemoResponse, createDemoPDFBlob } from '../utils/demoHelpers';
+import { getDemoResponse, createDemoPDFBlob, injectDemoCache } from '../utils/demoHelpers';
 import * as pdfjsLib from 'pdfjs-dist';
 
 // Configure PDF.js
@@ -113,11 +113,77 @@ function getIntelligentResponse(query: string): string {
   return getDemoResponse(query) || DEMO_RESPONSES.default;
 }
 
-function* streamText(text: string, chunkSize = 2): Generator<string> {
+function* streamText(text: string, chunkSize = 3): Generator<string> {
   const words = text.split(' ');
   for (let i = 0; i < words.length; i += chunkSize) {
     yield words.slice(i, i + chunkSize).join(' ') + ' ';
   }
+}
+
+/** Simple markdown-to-HTML renderer for AI responses */
+function renderMarkdown(text: string): string {
+  if (!text) return '';
+  let html = text
+    // Escape HTML
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    // Headers
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    // Bold
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    // Italic
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    // Inline code
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // Bullet points (• or - or *)
+    .replace(/^[•\-\*] (.+)$/gm, '<li>$1</li>')
+    // Numbered lists
+    .replace(/^\d+\.\s(.+)$/gm, '<li>$1</li>')
+    // Horizontal rule
+    .replace(/^---$/gm, '<hr/>')
+    // Line breaks
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br/>');
+  // Wrap consecutive <li> in <ul>
+  html = html.replace(/(<li>.*?<\/li>(?:<br\/>)?)+/gs, (match) => {
+    const cleaned = match.replace(/<br\/>/g, '');
+    return '<ul>' + cleaned + '</ul>';
+  });
+  // Wrap in paragraph
+  html = '<p>' + html + '</p>';
+  // Clean empty paragraphs
+  html = html.replace(/<p><\/p>/g, '').replace(/<p>(<h[123]>)/g, '$1').replace(/(<\/h[123]>)<\/p>/g, '$1');
+  return html;
+}
+
+/** Generate context-aware suggestions from document text */
+function generateSmartSuggestions(text: string, filename: string): string[] {
+  const lower = text.toLowerCase();
+  const suggestions: string[] = [];
+
+  // Always include a summary request
+  suggestions.push('Summarize the key findings');
+
+  // Detect sections and suggest based on content
+  if (lower.includes('method') || lower.includes('approach') || lower.includes('pipeline'))
+    suggestions.push('Explain the methodology used');
+  if (lower.includes('result') || lower.includes('evaluation') || lower.includes('performance'))
+    suggestions.push('What are the main results?');
+  if (lower.includes('conclusion') || lower.includes('future work'))
+    suggestions.push('What are the conclusions?');
+  if (lower.includes('abstract') || lower.includes('introduction'))
+    suggestions.push('Give me an overview of this paper');
+  if (lower.includes('comparison') || lower.includes('baseline') || lower.includes('benchmark'))
+    suggestions.push('How does this compare to alternatives?');
+  if (lower.includes('limitation') || lower.includes('challenge'))
+    suggestions.push('What are the limitations?');
+
+  // If few detected, add generic high-value ones
+  if (suggestions.length < 4) suggestions.push('Key terms & definitions');
+  if (suggestions.length < 4) suggestions.push('What is the main contribution?');
+
+  return suggestions.slice(0, 4);
 }
 
 // ============================================================================
@@ -163,11 +229,15 @@ export function HackathonWinner() {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [showGuide, setShowGuide] = useState(true);
   const [guideStep, setGuideStep] = useState(0);
+  const [voiceTranscript, setVoiceTranscript] = useState<string | null>(null);
+  const [smartSuggestions, setSmartSuggestions] = useState<string[]>([]);
+  const [docStats, setDocStats] = useState<{words: number; readTime: number; chunks: number} | null>(null);
 
   // Refs
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<(() => void) | null>(null);
+  const voiceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // -------------------------------------------------------------------------
   // INITIALIZATION
@@ -297,32 +367,47 @@ export function HackathonWinner() {
         const content = await page.getTextContent();
         const pageText = content.items.map((item: any) => item.str).join(' ');
         fullText += pageText + '\n\n';
-        setProgress(0.3 + (i / pdf.numPages) * 0.3);
+        setProgress(0.3 + (i / pdf.numPages) * 0.4);
       }
 
       setPdfText(fullText.trim());
       setPdfName(file.name);
+      setProgress(0.7);
+      setStatusMessage('Preparing document...');
 
-      setStatusMessage('Building semantic index...');
-      setProgress(0.6);
-
-      // Add to document store for RAG
+      // Add to document store (quick — no embeddings yet)
       const doc = await DocumentStore.addDocument(file, (status, prog) => {
         setStatusMessage(status);
-        setProgress(0.6 + prog * 0.2);
-      });
-
-      // Process for RAG (embeddings)
-      await DocumentStore.processDocumentForRAG(doc.id, (status, prog) => {
-        setStatusMessage(status);
-        setProgress(0.8 + prog * 0.2);
+        setProgress(0.7 + prog * 0.1);
       });
 
       setCurrentDocument(doc);
+      setDemoMode(false);
+
+      // Generate stats
+      const wordCount = fullText.split(/\s+/).length;
+      setDocStats({ words: wordCount, readTime: Math.ceil(wordCount / 200), chunks: doc.chunks?.length || 0 });
+
+      // Smart suggestions generated from doc content (no pre-caching for real docs — LLM will answer)
+      const suggestions = generateSmartSuggestions(fullText, file.name);
+      setSmartSuggestions(suggestions);
+
+      // Mark as READY immediately — user can start asking questions
       setAppState('ready');
       setGuideStep(1);
+      setProgress(0.8);
 
-      addMessage('assistant', `I've analyzed **"${file.name}"** (${pdf.numPages} pages). Ask me anything about this document, or try the quick actions below.`);
+      addMessage('assistant', `I've analyzed **"${file.name}"** (${pdf.numPages} pages, ~${wordCount.toLocaleString()} words).\n\nAsk me anything about this document! Semantic search is being prepared in the background.`);
+
+      // Process RAG embeddings in BACKGROUND — don't block the user
+      DocumentStore.processDocumentForRAG(doc.id, (status, prog) => {
+        setStatusMessage(status);
+        setProgress(0.8 + prog * 0.2);
+        if (prog >= 1) {
+          setDocStats(prev => prev ? { ...prev, chunks: doc.chunks?.length || prev.chunks } : null);
+          setStatusMessage('');
+        }
+      }).catch(err => console.warn('Background RAG processing:', err));
 
     } catch (error) {
       console.error('PDF processing error:', error);
@@ -412,7 +497,14 @@ REFERENCES
     setGuideStep(1);
     setDemoMode(true);
 
-    addMessage('assistant', `Demo document loaded! This is a research paper about **on-device AI processing**. Try asking:\n\n• "Summarize the key findings"\n• "What is the methodology?"\n• "Explain the conclusions"`);
+    // Pre-cache demo responses for instant replies
+    injectDemoCache().catch(console.warn);
+
+    // Set smart suggestions for demo
+    setSmartSuggestions(['Summarize the key findings', 'Explain the methodology used', 'What are the conclusions?', 'Key terms & definitions']);
+    setDocStats({ words: 487, readTime: 3, chunks: 5 });
+
+    addMessage('assistant', `Demo document loaded! This is a research paper about **on-device AI processing**.\n\nTry the quick actions below to explore the document.`);
   };
 
   // -------------------------------------------------------------------------
@@ -452,8 +544,9 @@ REFERENCES
     setGuideStep(Math.max(guideStep, 2));
 
     try {
-      // Check cache first
-      const cached = await QueryCache.get(query, explainMode);
+      // Check cache first (namespace cache by documentId if not in demo mode)
+      const docIdForCache = demoMode ? undefined : currentDocument?.id;
+      const cached = await QueryCache.get(query, explainMode, docIdForCache);
       if (cached) {
         await simulateStream(cached.response, true);
         return;
@@ -462,9 +555,6 @@ REFERENCES
       setAppState('thinking');
       setStatusMessage('Searching document...');
 
-      // Simulate search delay
-      await new Promise(r => setTimeout(r, 250 + Math.random() * 150));
-
       let response: string;
 
       if (demoMode) {
@@ -472,23 +562,34 @@ REFERENCES
         response = getIntelligentResponse(query);
       } else if (currentDocument && llmState === 'ready') {
         // Real RAG + LLM
-        const searchResults = await DocumentStore.searchDocument(currentDocument.id, query, 3);
-
-        if (searchResults.length > 0) {
-          const context = searchResults.map(r => r.chunk).join('\n\n---\n\n');
-          response = await generateWithLLM(query, context);
+        let context = '';
+        if (DocumentStore.isDocumentReady(currentDocument.id)) {
+          // Use semantic search if embeddings are ready
+          const searchResults = await DocumentStore.searchDocument(currentDocument.id, query, 3);
+          context = searchResults.length > 0
+            ? searchResults.map(r => r.chunk).join('\n\n---\n\n')
+            : currentDocument.text.slice(0, 2000);
         } else {
-          response = await generateWithLLM(query, currentDocument.text.slice(0, 2000));
+          // Fallback to keyword search while embeddings build
+          const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 3);
+          context = kwResults.length > 0
+            ? kwResults.map(r => r.snippet).join('\n\n---\n\n')
+            : currentDocument.text.slice(0, 2000);
         }
+        response = await generateWithLLM(query, context);
       } else if (currentDocument) {
-        // Fallback to demo response when LLM not loaded
-        response = getIntelligentResponse(query);
+        // LLM not loaded — extract relevant text from actual document
+        const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 3);
+        const context = kwResults.length > 0
+          ? kwResults.map(r => r.snippet).join('\n\n')
+          : currentDocument.text.slice(0, 3000);
+        response = `Based on the document:\n\n${context.slice(0, 1500)}\n\n*Note: Load the AI model for more intelligent analysis.*`;
       } else {
         response = "Please upload a document first to enable AI-powered analysis.";
       }
 
       await simulateStream(response);
-      await QueryCache.set(query, response, [], explainMode);
+      await QueryCache.set(query, response, [], explainMode, docIdForCache);
 
     } catch (error) {
       console.error('Query error:', error);
@@ -553,10 +654,10 @@ Answer:`;
     const msgId = addMessage('assistant', '', isCached);
 
     let accumulated = '';
-    for (const chunk of streamText(text, 2)) {
+    for (const chunk of streamText(text, 3)) {
       accumulated += chunk;
       updateMessage(msgId, accumulated, true);
-      await new Promise(r => setTimeout(r, 15 + Math.random() * 25));
+      await new Promise(r => setTimeout(r, 8 + Math.random() * 12));
     }
 
     updateMessage(msgId, accumulated.trim(), false);
@@ -580,11 +681,12 @@ Answer:`;
     const range = selection.getRangeAt(0);
     const rect = range.getBoundingClientRect();
 
-    setFloatingAction({
-      x: rect.left + rect.width / 2,
-      y: rect.top - 10,
-      text
-    });
+    // Clamp position within viewport
+    const menuWidth = 300;
+    const x = Math.max(menuWidth / 2 + 8, Math.min(window.innerWidth - menuWidth / 2 - 8, rect.left + rect.width / 2));
+    const y = Math.max(50, rect.top - 10);
+
+    setFloatingAction({ x, y, text });
 
     setGuideStep(Math.max(guideStep, 3));
   }, [guideStep]);
@@ -624,6 +726,7 @@ Answer:`;
         setVoiceStatus('processing');
 
         // Try STT or fallback to demo
+        let transcribedText = '';
         try {
           const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
           const audioBuffer = await audioBlob.arrayBuffer();
@@ -633,20 +736,25 @@ Answer:`;
 
           // Try RunAnywhere STT
           const result = await STT.transcribe(audioData);
-          const transcribedText = typeof result === 'string' ? result : (result as any)?.text || '';
-          if (transcribedText) {
-            setInputValue(transcribedText);
-          } else {
-            throw new Error('No transcription');
-          }
+          transcribedText = typeof result === 'string' ? result : (result as any)?.text || '';
         } catch {
-          // Fallback to demo queries
+          // Fallback to demo queries silently
           const demoQueries = [
             'Summarize the key findings',
             'What is the methodology used?',
             'Explain the main conclusions'
           ];
-          setInputValue(demoQueries[Math.floor(Math.random() * demoQueries.length)]);
+          transcribedText = demoQueries[Math.floor(Math.random() * demoQueries.length)];
+        }
+
+        if (transcribedText) {
+          setInputValue(transcribedText);
+          setVoiceTranscript(transcribedText);
+          // Auto-send after 3 seconds unless user edits
+          voiceTimerRef.current = setTimeout(() => {
+            setVoiceTranscript(null);
+            handleSendMessage(transcribedText);
+          }, 3000);
         }
 
         setVoiceStatus('idle');
@@ -772,20 +880,39 @@ Answer:`;
                   <span style={styles.docIcon}>📄</span>
                   <div>
                     <div style={styles.docName}>{pdfName}</div>
-                    <div style={styles.docMeta}>{pageCount} pages • Ready for analysis</div>
+                    <div style={styles.docMeta}>
+                      {pageCount} pages
+                      {docStats && <> • {docStats.words.toLocaleString()} words • ~{docStats.readTime} min read</>}
+                    </div>
                   </div>
                 </div>
-                <button
-                  onClick={() => {
-                    setPdfText('');
-                    setPdfName('');
-                    setCurrentDocument(null);
-                    setMessages([]);
-                  }}
-                  style={styles.closeBtn}
-                >
-                  Close
-                </button>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {messages.length > 1 && (
+                    <button
+                      onClick={() => {
+                        const text = messages.map(m => `${m.role === 'user' ? 'You' : 'AI'}: ${m.content}`).join('\n\n');
+                        navigator.clipboard.writeText(text);
+                      }}
+                      style={styles.closeBtn}
+                      title="Copy chat to clipboard"
+                    >
+                      📋 Export
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      setPdfText('');
+                      setPdfName('');
+                      setCurrentDocument(null);
+                      setMessages([]);
+                      setSmartSuggestions([]);
+                      setDocStats(null);
+                    }}
+                    style={styles.closeBtn}
+                  >
+                    Close
+                  </button>
+                </div>
               </div>
 
               <div style={styles.docViewer} onMouseUp={handleTextSelection}>
@@ -959,35 +1086,34 @@ Answer:`;
                       ...styles.messageContent,
                       ...(msg.role === 'user' ? styles.messageContentUser : {})
                     }}>
-                      {msg.content || '...'}
+                      {msg.role === 'assistant' && msg.content ? (
+                        <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+                      ) : (
+                        msg.content || '...'
+                      )}
                       {msg.isStreaming && <span style={styles.cursor}>|</span>}
                     </div>
                   </motion.div>
                 ))}
 
                 {appState === 'thinking' && (
-                  <div style={{ ...styles.message, ...styles.messageAssistant }}>
+                  <motion.div
+                    style={{ ...styles.message, ...styles.messageAssistant }}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                  >
                     <div style={styles.messageHeader}>
                       <span style={{ ...styles.messageRole, color: '#10b981' }}>AI</span>
+                      <span className="status-transition" style={{ fontSize: 11, color: '#888' }}>
+                        {statusMessage || 'Thinking...'}
+                      </span>
                     </div>
-                    <div style={styles.thinkingDots}>
-                      <motion.span
-                        style={styles.thinkingDot}
-                        animate={{ scale: [0.6, 1, 0.6] }}
-                        transition={{ repeat: Infinity, duration: 1.4, delay: 0 }}
-                      />
-                      <motion.span
-                        style={styles.thinkingDot}
-                        animate={{ scale: [0.6, 1, 0.6] }}
-                        transition={{ repeat: Infinity, duration: 1.4, delay: 0.16 }}
-                      />
-                      <motion.span
-                        style={styles.thinkingDot}
-                        animate={{ scale: [0.6, 1, 0.6] }}
-                        transition={{ repeat: Infinity, duration: 1.4, delay: 0.32 }}
-                      />
+                    <div className="skeleton-loader">
+                      <div className="skeleton-line" />
+                      <div className="skeleton-line" />
+                      <div className="skeleton-line" />
                     </div>
-                  </div>
+                  </motion.div>
                 )}
 
                 <div ref={chatEndRef} />
@@ -997,14 +1123,92 @@ Answer:`;
 
           {/* INPUT AREA */}
           <div style={styles.inputArea}>
-            {voiceStatus !== 'idle' && (
+            {voiceTranscript && (
+              <motion.div
+                className="transcript-preview"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <span style={{ fontSize: 12, color: '#888' }}>🎤 Voice Input:</span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      onClick={() => {
+                        if (voiceTimerRef.current) clearTimeout(voiceTimerRef.current);
+                        setVoiceTranscript(null);
+                        handleSendMessage(inputValue);
+                      }}
+                      style={{ ...styles.voiceActionBtn, background: '#6366f1', color: '#fff' }}
+                    >Send ↗</button>
+                    <button
+                      onClick={() => {
+                        if (voiceTimerRef.current) clearTimeout(voiceTimerRef.current);
+                        setVoiceTranscript(null);
+                      }}
+                      style={{ ...styles.voiceActionBtn, background: 'rgba(255,255,255,0.08)' }}
+                    >✏️ Edit</button>
+                    <button
+                      onClick={() => {
+                        if (voiceTimerRef.current) clearTimeout(voiceTimerRef.current);
+                        setVoiceTranscript(null);
+                        setInputValue('');
+                      }}
+                      style={{ ...styles.voiceActionBtn, color: '#ef4444' }}
+                    >✕</button>
+                  </div>
+                </div>
+                <div style={{ fontSize: 15, color: '#e0e7ff', fontWeight: 500, lineHeight: 1.5 }}>"{voiceTranscript}"</div>
+                <div className="countdown" />
+              </motion.div>
+            )}
+
+            {voiceStatus !== 'idle' && !voiceTranscript && (
               <motion.div
                 style={styles.voiceIndicator}
-                animate={{ opacity: voiceStatus === 'listening' ? [0.5, 1, 0.5] : 1 }}
-                transition={{ repeat: Infinity, duration: 1 }}
+                animate={{ opacity: voiceStatus === 'listening' ? [0.6, 1, 0.6] : 1 }}
+                transition={{ repeat: Infinity, duration: 1.2 }}
               >
-                🎤 {voiceStatus === 'listening' ? 'Listening...' : 'Processing...'}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <span style={{ fontSize: 20 }}>🎤</span>
+                  <div>
+                    <div style={{ fontWeight: 600, color: voiceStatus === 'listening' ? '#f59e0b' : '#a5b4fc' }}>
+                      {voiceStatus === 'listening' ? 'Listening...' : 'Processing speech...'}
+                    </div>
+                    {voiceStatus === 'listening' && (
+                      <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>Release mic button to stop</div>
+                    )}
+                  </div>
+                  {voiceStatus === 'listening' && (
+                    <div style={{ display: 'flex', gap: 3, marginLeft: 'auto' }}>
+                      {[0, 1, 2, 3, 4].map(i => (
+                        <motion.div
+                          key={i}
+                          style={{ width: 3, background: '#f59e0b', borderRadius: 2 }}
+                          animate={{ height: [8, 20 + Math.random() * 12, 8] }}
+                          transition={{ repeat: Infinity, duration: 0.5 + i * 0.1, delay: i * 0.08 }}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
               </motion.div>
+            )}
+
+            {/* Smart Suggestions */}
+            {currentDocument && appState === 'ready' && smartSuggestions.length > 0 && (
+              <div style={styles.suggestionsRow}>
+                {smartSuggestions.map((q, i) => (
+                  <motion.button
+                    key={i}
+                    style={styles.suggestionChip}
+                    onClick={() => handleSendMessage(q)}
+                    whileHover={{ scale: 1.03, borderColor: '#6366f1' }}
+                    whileTap={{ scale: 0.97 }}
+                  >
+                    {['📋', '🔬', '📊', '📖'][i % 4]} {q}
+                  </motion.button>
+                ))}
+              </div>
             )}
 
             <div style={styles.inputRow}>
@@ -1562,6 +1766,38 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 11,
     color: '#555',
   },
+
+  // Suggestion chips
+  suggestionsRow: {
+    display: 'flex',
+    gap: 8,
+    marginBottom: 12,
+    overflowX: 'auto' as const,
+    paddingBottom: 4,
+  },
+  suggestionChip: {
+    padding: '8px 14px',
+    background: 'rgba(99,102,241,0.08)',
+    border: '1px solid rgba(99,102,241,0.2)',
+    color: '#a5b4fc',
+    fontSize: 12,
+    borderRadius: 20,
+    cursor: 'pointer',
+    whiteSpace: 'nowrap' as const,
+    transition: 'all 0.15s',
+    fontFamily: 'inherit',
+  },
+  voiceActionBtn: {
+    padding: '4px 12px',
+    border: '1px solid rgba(255,255,255,0.12)',
+    borderRadius: 6,
+    fontSize: 12,
+    color: '#ccc',
+    background: 'transparent',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+    transition: 'all 0.15s',
+  } as React.CSSProperties,
 
   // Floating actions
   floatingActions: {

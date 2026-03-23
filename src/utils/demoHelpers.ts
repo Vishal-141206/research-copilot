@@ -300,7 +300,22 @@ export async function preloadDemoResources(): Promise<void> {
 /**
  * Inject demo data into query cache
  */
-export function injectDemoCache(): void {
-  // This would populate the query cache with pre-computed responses
-  console.log('[Demo] Injecting cached responses');
+export async function injectDemoCache(): Promise<void> {
+  const { QueryCache } = await import('./queryCache');
+  const queriesToCache = [
+    'Summarize the key findings',
+    'What is the methodology?',
+    'Explain the conclusions',
+    'summarize',
+    'findings',
+    'methodology',
+    'conclusions',
+  ];
+  for (const q of queriesToCache) {
+    const resp = getDemoResponse(q);
+    if (resp) {
+      await QueryCache.set(q, resp, [], 'simple');
+    }
+  }
+  console.log('[Demo] Injected cached responses for', queriesToCache.length, 'queries');
 }
