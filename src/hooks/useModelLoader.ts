@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { ModelManager, ModelCategory, EventBus } from '@runanywhere/web';
 
 export type LoaderState = 'idle' | 'downloading' | 'loading' | 'ready' | 'error';
@@ -24,6 +24,20 @@ export function useModelLoader(category: ModelCategory, coexist = false): ModelL
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const loadingRef = useRef(false);
+
+  // Watch for model load events
+  useEffect(() => {
+    const checkLoaded = () => {
+      if (ModelManager.getLoadedModel(category)) {
+        setState('ready');
+      }
+    };
+
+    const unsub = EventBus.shared.on('model.loaded', checkLoaded);
+    checkLoaded(); // Check immediately
+
+    return unsub;
+  }, [category]);
 
   const ensure = useCallback(async (): Promise<boolean> => {
     // Already loaded

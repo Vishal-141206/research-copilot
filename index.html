@@ -1,15 +1,183 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <!-- Primary Meta Tags -->
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="theme-color" content="#0F172A" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+
+  <!-- SEO Meta Tags -->
+  <title>Research Copilot - AI-Powered Document Analysis | 100% Private & Offline</title>
+  <meta name="title" content="Research Copilot - AI-Powered Document Analysis | 100% Private & Offline" />
+  <meta name="description" content="Analyze research papers, PDFs, and documents with AI that runs entirely on your device. No data ever leaves your browser. Works offline. Free and open source." />
+  <meta name="keywords" content="AI, research assistant, PDF analysis, document AI, offline AI, privacy, local AI, RAG, semantic search, research copilot" />
+  <meta name="author" content="Research Copilot" />
+  <meta name="robots" content="index, follow" />
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://research-copilot.app/" />
+  <meta property="og:title" content="Research Copilot - AI-Powered Document Analysis" />
+  <meta property="og:description" content="Analyze research papers with AI that runs 100% locally. Your data never leaves your device." />
+  <meta property="og:image" content="/og-image.png" />
+  <meta property="og:site_name" content="Research Copilot" />
+
+  <!-- Twitter -->
+  <meta property="twitter:card" content="summary_large_image" />
+  <meta property="twitter:url" content="https://research-copilot.app/" />
+  <meta property="twitter:title" content="Research Copilot - Private AI Document Analysis" />
+  <meta property="twitter:description" content="AI-powered research assistant that runs entirely in your browser. 100% private, works offline." />
+  <meta property="twitter:image" content="/og-image.png" />
+
+  <!-- PWA / Mobile App -->
+  <meta name="application-name" content="Research Copilot" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Research Copilot" />
   <meta name="mobile-web-app-capable" content="yes" />
-  <title>AI Research Copilot - 100% Local & Private (RunAnywhere SDK)</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>" />
+  <meta name="theme-color" content="#0a0a0f" />
+  <meta name="msapplication-TileColor" content="#6366f1" />
+  <meta name="msapplication-config" content="/browserconfig.xml" />
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+  <link rel="manifest" href="/manifest.json" />
+
+  <!-- Preconnect to external resources -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link rel="preconnect" href="https://huggingface.co" />
+
+  <!-- Preload critical fonts -->
+  <link rel="preload" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" as="style" onload="this.onload=null;this.rel='stylesheet'" />
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" /></noscript>
+
+  <!-- Critical CSS for initial load -->
+  <style>
+    /* Critical above-the-fold styles */
+    *, *::before, *::after {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body, #root {
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+      color: #ffffff;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* Initial loading state */
+    #root:empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #root:empty::before {
+      content: '';
+      width: 48px;
+      height: 48px;
+      border: 3px solid rgba(99, 102, 241, 0.2);
+      border-top-color: #6366f1;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Scrollbar styling */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 3px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    /* Selection styling */
+    ::selection {
+      background: rgba(99, 102, 241, 0.3);
+      color: #fff;
+    }
+  </style>
 </head>
 <body>
+  <!-- App Root -->
   <div id="root"></div>
+
+  <!-- Noscript fallback -->
+  <noscript>
+    <div style="
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      text-align: center;
+      padding: 32px;
+    ">
+      <div style="
+        width: 80px;
+        height: 80px;
+        background: linear-gradient(135deg, #6366f1, #a855f7);
+        border-radius: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 24px;
+        font-weight: 800;
+        margin-bottom: 24px;
+      ">AI</div>
+      <h1 style="font-size: 24px; font-weight: 600; margin-bottom: 12px;">
+        Research Copilot
+      </h1>
+      <p style="color: #888; max-width: 400px; line-height: 1.6;">
+        JavaScript is required to run this application. Please enable JavaScript in your browser settings and reload the page.
+      </p>
+    </div>
+  </noscript>
+
+  <!-- Main app script -->
   <script type="module" src="/src/main.tsx"></script>
+
+  <!-- Analytics (placeholder - replace with your analytics) -->
+  <!--
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-XXXXXXXXXX"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-XXXXXXXXXX');
+  </script>
+  -->
 </body>
 </html>

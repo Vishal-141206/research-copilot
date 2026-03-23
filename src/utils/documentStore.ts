@@ -1,9 +1,11 @@
 /**
- * DocumentStore - Manages uploaded PDFs and extracted text
- * Stores documents in browser localStorage for persistence
+ * DocumentStore - Manages uploaded PDFs with RAG capabilities
+ * Stores documents with text chunks and embeddings for semantic search
  */
 
 import * as pdfjsLib from 'pdfjs-dist';
+import { chunkText } from './pdfProcessor';
+import { generateEmbeddings, searchSimilarChunks, SearchResult } from './embeddings';
 
 // Configure PDF.js worker with CDN for reliability
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
@@ -15,6 +17,8 @@ export interface Document {
   pages: number;
   uploadedAt: number;
   size: number;
+  chunks?: string[];
+  embeddings?: number[][];
 }
 
 const STORAGE_KEY = 'research-copilot-documents';
@@ -57,8 +61,12 @@ class DocumentStoreClass {
     return () => this.listeners.delete(listener);
   }
 
-  async addDocument(file: File): Promise<Document> {
+  async addDocument(
+    file: File,
+    onProgress?: (status: string, progress: number) => void
+  ): Promise<Document> {
     // Extract text from PDF
+    if (onProgress) onProgress('Extracting text from PDF...', 0);
     const arrayBuffer = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     
@@ -70,8 +78,13 @@ class DocumentStoreClass {
         .map((item: any) => item.str)
         .join(' ');
       text += pageText + '\n\n';
+      
+      if (onProgress) {
+        onProgress('Extracting text from PDF...', i / pdf.numPages * 0.3);
+      }
     }
 
+    // Create document
     const doc: Document = {
       id: `doc-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       name: file.name,
@@ -86,6 +99,63 @@ class DocumentStoreClass {
     this.notifyListeners();
 
     return doc;
+  }
+
+  /**
+   * Process document for RAG: chunk text and generate embeddings
+   */
+  async processDocumentForRAG(
+    docId: string,
+    onProgress?: (status: string, progress: number) => void
+  ): Promise<void> {
+    const doc = this.documents.get(docId);
+    if (!doc) throw new Error('Document not found');
+
+    // Chunk the text
+    if (onProgress) onProgress('Chunking document...', 0.3);
+    const chunks = chunkText(doc.text, 500, 50);
+    doc.chunks = chunks;
+
+    // Generate embeddings
+    if (onProgress) onProgress('Generating embeddings...', 0.4);
+    const embeddings = await generateEmbeddings(chunks, (current, total) => {
+      if (onProgress) {
+        const progress = 0.4 + (current / total) * 0.6;
+        onProgress(`Generating embeddings (${current}/${total})...`, progress);
+      }
+    });
+    doc.embeddings = embeddings;
+
+    this.documents.set(docId, doc);
+    // Note: We don't save embeddings to localStorage as they're too large
+    this.notifyListeners();
+
+    if (onProgress) onProgress('Document ready for RAG!', 1);
+  }
+
+  /**
+   * Search for relevant chunks in a document using semantic search
+   */
+  async searchDocument(
+    docId: string,
+    query: string,
+    topK: number = 3
+  ): Promise<SearchResult[]> {
+    const doc = this.documents.get(docId);
+    if (!doc) throw new Error('Document not found');
+    if (!doc.chunks || !doc.embeddings) {
+      throw new Error('Document not processed for RAG. Call processDocumentForRAG first.');
+    }
+
+    return searchSimilarChunks(query, doc.chunks, doc.embeddings, topK);
+  }
+
+  /**
+   * Check if a document is ready for RAG
+   */
+  isDocumentReady(docId: string): boolean {
+    const doc = this.documents.get(docId);
+    return !!(doc?.chunks && doc?.embeddings);
   }
 
   removeDocument(id: string) {

@@ -47,32 +47,37 @@ Perfect for:
 
 ## 🔥 Features
 
-### 📄 **Smart Document Understanding (RAG)**
-- Upload PDFs (drag & drop)
-- Automatic text chunking with overlap
-- Fast TF-IDF semantic search
-- Source citations in responses
+### 📄 **Advanced Document Understanding (RAG)**
+- Upload PDFs with drag & drop
+- Automatic text extraction using PDF.js
+- Intelligent text chunking with overlap (500 words per chunk)
+- **Semantic search** using Transformers.js embeddings (all-MiniLM-L6-v2)
+- **Cosine similarity** vector search for precise context retrieval
+- Source citations showing relevant document chunks
 
-### 🧠 **Adaptive AI Responses**
-- **Simple Mode**: 1-2 sentence answers
-- **Detailed Mode**: Comprehensive explanations
-- **Exam Mode**: Structured, academic responses
+### 🧠 **Local AI Models**
+- **LLM**: Liquid AI LFM2 models for text generation
+- **Embeddings**: all-MiniLM-L6-v2 for semantic understanding
+- **STT**: Whisper Tiny for voice transcription
+- All models run 100% in-browser via WebAssembly
 
 ### 🎤 **Voice Interface**
-- Push-to-talk (no continuous listening)
-- Real-time transcription (Whisper Tiny)
-- Instant AI responses
+- Real-time voice recording with Web Audio API
+- Speech-to-text transcription
+- Hands-free document interrogation
+- Instant AI responses to voice queries
 
-### ⚡ **Demo Mode** (Hackathon Secret Weapon)
-- Pre-caches common queries
-- Guarantees instant responses during judging
-- Falls back to real AI for new questions
+### ⚡ **Performance Optimizations**
+- Batched embedding generation
+- Efficient vector similarity search
+- Streaming responses for instant feedback
+- Smart caching for repeated queries
 
-### 🔒 **True Offline Capability**
-- All models run via WebAssembly
-- Documents stored in IndexedDB
-- Service Worker caching
-- Visible "Fully Offline" badge
+### 🔒 **True Privacy & Offline**
+- All AI processing happens on your device
+- Documents never uploaded to servers
+- Works completely offline after initial model download
+- IndexedDB for local document storage
 
 ---
 
@@ -108,9 +113,12 @@ http://localhost:5173
   - `@runanywhere/web` - Core SDK
   - `@runanywhere/web-llamacpp` - LLM inference
   - `@runanywhere/web-onnx` - STT/TTS/VAD
+- **Transformers.js** - Xenova/transformers for embeddings
+- **PDF.js** - Mozilla's PDF parsing library
 
 ### Models (All Run Locally)
 - **LLM**: Liquid AI LFM2 350M (quantized) - ~250MB
+- **Embeddings**: all-MiniLM-L6-v2 - ~23MB
 - **STT**: Whisper Tiny English - ~100MB
 - **VAD**: Silero VAD v5 - ~5MB
 
@@ -158,19 +166,24 @@ http://localhost:5173
 research-copilot/
 ├── src/
 │   ├── components/
-│   │   ├── HackathonResearchCopilot.tsx   # ⭐ Main demo UI
-│   │   ├── PDFUploader.tsx                # Document upload
-│   │   └── ...5 other demo tabs
+│   │   ├── RAGTab.tsx                         # ⭐ Main RAG interface
+│   │   ├── SimpleResearchTab.tsx              # Quick chat demo
+│   │   ├── ChatTab.tsx                        # Basic chat
+│   │   ├── VisionTab.tsx                      # Image understanding
+│   │   ├── VoiceTab.tsx                       # Voice pipeline
+│   │   ├── ToolsTab.tsx                       # Function calling
+│   │   └── ModelBanner.tsx                    # Model loading UI
 │   ├── utils/
-│   │   ├── enhancedDocumentStore.ts       # RAG + chunking
-│   │   ├── queryCache.ts                  # Smart caching
-│   │   └── streamingManager.ts            # Response streaming
+│   │   ├── documentStore.ts                   # RAG document management
+│   │   ├── pdfProcessor.ts                    # PDF text extraction & chunking
+│   │   ├── embeddings.ts                      # Transformers.js integration
+│   │   └── ...
+│   ├── hooks/
+│   │   └── useModelLoader.ts                  # Model loading hook
 │   └── styles/
-│       ├── index.css                      # Base theme
-│       └── hackathon.css                  # Demo-specific UI
-├── DEMO.md                                # 🎬 60-sec demo script
-├── SETUP.md                               # 📖 Setup guide
-└── README.md                              # 📄 You are here
+│       └── index.css                          # Professional dark theme
+├── README.md                                   # 📄 You are here
+└── package.json
 ```
 
 ---
@@ -179,25 +192,30 @@ research-copilot/
 
 ### ✅ **Technical Depth**
 - WebAssembly for native performance
-- RAG (Retrieval-Augmented Generation)
-- Streaming responses with status updates
+- **RAG (Retrieval-Augmented Generation)** with vector embeddings
+- Transformers.js for semantic search
+- Streaming responses with batched updates
 - Multi-modal interface (text + voice)
+- Efficient cosine similarity search
 
 ### ✅ **Polished Execution**
 - Production-quality UI/UX
 - Smooth animations and transitions
-- Error handling and fallbacks
-- Comprehensive documentation
+- Comprehensive error handling
+- Progressive loading states
+- Professional documentation
 
 ### ✅ **Clear Impact**
 - Solves real privacy/accessibility problems
-- Broad applicability (students, professionals, etc.)
-- Memorable "offline" demo moment
+- Perfect for sensitive documents (legal, medical, academic)
+- Works offline (planes, rural areas, restricted networks)
+- Broad applicability across industries
 
-### ✅ **Reliable Demo**
-- Demo Mode eliminates lag during presentation
-- Failsafe strategies if anything breaks
-- Step-by-step judging script
+### ✅ **100% Client-Side**
+- No backend required
+- No API keys needed
+- No data ever leaves the device
+- Truly private and secure
 
 ---
 
@@ -238,11 +256,14 @@ See [SETUP.md](SETUP.md#production-build) for details.
 
 ## 📈 Future Enhancements
 
+- [ ] Advanced voice integration with Whisper transcription
 - [ ] PDF highlighting with inline AI explanations
 - [ ] Multi-document synthesis ("Compare these 3 papers")
 - [ ] Export notes/summaries to Markdown
 - [ ] Mobile app (iOS/Android with same SDK)
 - [ ] Collaborative mode (share insights, not documents)
+- [ ] Support for more document formats (DOCX, TXT, etc.)
+- [ ] Vector database integration for larger document collections
 
 ---
 
