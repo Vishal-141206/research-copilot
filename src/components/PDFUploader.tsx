@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import { DocumentStore, type Document } from '../utils/enhancedDocumentStore';
+import { DocumentStore, type Document } from '../utils/documentStore';
 
 interface PDFUploaderProps {
   onUploadComplete?: (doc: Document) => void;

@@ -1,21 +1,19 @@
-import { HackathonWinner } from './components/HackathonWinner';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { initSDK } from './runanywhere';
-import { useEffect, useState } from 'react';
+
+// Lazy load the massive app component to reduce initial JS payload
+const HackathonWinner = lazy(() => import('./components/HackathonWinner').then(m => ({ default: m.HackathonWinner })));
 
 export function App() {
   const [ready, setReady] = useState(false);
   const [initError, setInitError] = useState(false);
 
   useEffect(() => {
-    initSDK()
-      .then(() => setReady(true))
-      .catch((err) => {
-        console.warn('SDK initialization warning:', err);
-        // Don't block the app - continue with demo mode
-        setInitError(true);
-        setReady(true);
-      });
+    // initSDK() is now handled globally in main.tsx for zero-latency boot.
+    // We just wait a tiny bit to ensure the singleton is resolving.
+    const timer = setTimeout(() => setReady(true), 1500);
+    return () => clearTimeout(timer);
   }, []);
 
   // Premium loading screen
@@ -65,7 +63,9 @@ export function App() {
   // Graceful error handling - still show app
   return (
     <ErrorBoundary>
-      <HackathonWinner />
+      <Suspense fallback={<div style={{ height: '100vh', background: '#0f0f0f' }} />}>
+        <HackathonWinner />
+      </Suspense>
     </ErrorBoundary>
   );
 }

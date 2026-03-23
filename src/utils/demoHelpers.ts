@@ -314,7 +314,7 @@ export async function injectDemoCache(): Promise<void> {
   for (const q of queriesToCache) {
     const resp = getDemoResponse(q);
     if (resp) {
-      await QueryCache.set(q, resp, [], 'simple');
+      await QueryCache.save(q, resp, [], 'simple');
     }
   }
   console.log('[Demo] Injected cached responses for', queriesToCache.length, 'queries');

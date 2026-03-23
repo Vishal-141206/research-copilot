@@ -1,6 +1,6 @@
-import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
+import { initSDK } from './runanywhere';
 import './styles/app.css';
 
 // Register Service Worker for offline capability
@@ -16,9 +16,9 @@ if ('serviceWorker' in navigator) {
       });
   });
 }
+// 2. Clear Screen and Render App
+// (We don't use StrictMode as it causes double-initialization of the AI WASM singletons)
+createRoot(document.getElementById('root')!).render(<App />);
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+// 3. Pre-initialize AI logic (WASM engine starts warming up immediately)
+initSDK().catch(e => console.error('Failed to init AI:', e));

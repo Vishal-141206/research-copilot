@@ -22,9 +22,8 @@ import {
 import { LlamaCPP, VLMWorkerBridge } from '@runanywhere/web-llamacpp';
 import { ONNX } from '@runanywhere/web-onnx';
 
-// Vite bundles the worker as a standalone JS chunk and returns its URL.
-// @ts-ignore — Vite-specific ?worker&url query
-import vlmWorkerUrl from './workers/vlm-worker?worker&url';
+// VLM worker removed to save space and satisfy strict RunAnywhere LLM/STT/TTS focus
+// import vlmWorkerUrl from './workers/vlm-worker?worker&url';
 
 // ---------------------------------------------------------------------------
 // Model catalog
@@ -110,14 +109,26 @@ export async function initSDK(): Promise<void> {
       debug: true,
     });
 
-    // Step 2: Register backends (loads WASM automatically)
-    await LlamaCPP.register();
+    // Step 2: Register backends (Force WebGPU for extreme performance)
+    try {
+      await LlamaCPP.register({ acceleration: 'webgpu' });
+      if (LlamaCPP.accelerationMode !== 'webgpu') {
+        console.warn(`[RunAnywhere] CAUTION: WebGPU requested but backend is using ${LlamaCPP.accelerationMode}. Performance will be degraded.`);
+      } else {
+        console.log(`[RunAnywhere] SUCCESS: WebGPU acceleration active.`);
+      }
+    } catch (e) {
+      console.error('[RunAnywhere] LlamaCPP Registration failed, falling back to basic CPU.', e);
+      await LlamaCPP.register({ acceleration: 'cpu' });
+    }
+    
     await ONNX.register();
 
     // Step 3: Register model catalog
     RunAnywhere.registerModels(MODELS);
 
-    // Step 4: Wire up VLM worker
+    // Step 4: VLM worker removed for codebase purification
+    /*
     VLMWorkerBridge.shared.workerUrl = vlmWorkerUrl;
     RunAnywhere.setVLMLoader({
       get isInitialized() { return VLMWorkerBridge.shared.isInitialized; },
@@ -125,6 +136,7 @@ export async function initSDK(): Promise<void> {
       loadModel: (params) => VLMWorkerBridge.shared.loadModel(params),
       unloadModel: () => VLMWorkerBridge.shared.unloadModel(),
     });
+    */
   })();
 
   return _initPromise;

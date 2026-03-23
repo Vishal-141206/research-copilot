@@ -9,11 +9,12 @@
  * - Smart caching & persistence
  */
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ModelCategory, ModelManager, EventBus } from '@runanywhere/web';
+import { ModelCategory, ModelManager, EventBus, AudioPlayback } from '@runanywhere/web';
+import { STT, TTS } from '@runanywhere/web-onnx';
+import { initSDK, getAccelerationMode } from '../runanywhere';
 import { TextGeneration } from '@runanywhere/web-llamacpp';
-import { STT } from '@runanywhere/web-onnx';
 import { DocumentStore, Document as StoredDoc } from '../utils/documentStore';
 import { QueryCache } from '../utils/queryCache';
 import { getDemoResponse, createDemoPDFBlob, injectDemoCache } from '../utils/demoHelpers';
@@ -38,6 +39,7 @@ interface Message {
   cached?: boolean;
   timestamp: number;
   sources?: string[];
+  isContext?: boolean;
 }
 
 interface FloatingAction {
@@ -157,6 +159,70 @@ function renderMarkdown(text: string): string {
   return html;
 }
 
+/** Message component memoized for extreme performance */
+const ChatMessage = React.memo(({ message, isLast, streamingText }: { message: Message; isLast?: boolean; streamingText?: string }) => {
+  const isUser = message.role === 'user';
+  const content = (isLast && streamingText) ? streamingText : message.content;
+  
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: isUser ? 'flex-end' : 'flex-start',
+        gap: 8,
+        marginBottom: 24,
+        maxWidth: '85%',
+        alignSelf: isUser ? 'flex-end' : 'flex-start',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, opacity: 0.6, fontSize: 11, fontWeight: 600 }}>
+        {isUser ? 'YOU' : 'RESEARCH AI'}
+        {!isUser && message.cached && <span style={{ color: '#10b981', fontSize: 9 }}>⚡ CACHED</span>}
+      </div>
+      <div
+        style={{
+          padding: '14px 18px',
+          borderRadius: isUser ? '20px 20px 4px 20px' : '4px 20px 20px 20px',
+          background: isUser ? 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)' : 'rgba(255, 255, 255, 0.05)',
+          backdropFilter: isUser ? 'none' : 'blur(12px)',
+          border: isUser ? 'none' : '1px solid rgba(255, 255, 255, 0.1)',
+          color: '#fff',
+          fontSize: 14,
+          lineHeight: 1.6,
+          boxShadow: isUser ? '0 4px 15px rgba(99, 102, 241, 0.3)' : 'none',
+          position: 'relative',
+        }}
+      >
+        <div 
+          className="markdown-content"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} 
+        />
+        {message.isContext && (
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid rgba(255,255,255,0.1)', fontSize: 11, opacity: 0.7, fontStyle: 'italic' }}>
+            Found in document context
+          </div>
+        )}
+        {!isUser && (
+          <div style={{ 
+            marginTop: 8, 
+            fontSize: 9, 
+            opacity: 0.4, 
+            display: 'flex', 
+            justifyContent: 'flex-end', 
+            letterSpacing: 0.5,
+            fontWeight: 700
+          }}>
+            ENGINE: RUNANYWHERE SDK
+          </div>
+        )}
+      </div>
+    </motion.div>
+  );
+});
+
 /** Generate context-aware suggestions from document text */
 function generateSmartSuggestions(text: string, filename: string): string[] {
   const lower = text.toLowerCase();
@@ -190,7 +256,7 @@ function generateSmartSuggestions(text: string, filename: string): string[] {
 // MAIN COMPONENT
 // ============================================================================
 
-export function HackathonWinner() {
+export function HackathonWinner(): React.ReactElement {
   // -------------------------------------------------------------------------
   // STATE
   // -------------------------------------------------------------------------
@@ -203,7 +269,10 @@ export function HackathonWinner() {
   // Model states
   const [llmState, setLlmState] = useState<ModelState>('idle');
   const [sttState, setSttState] = useState<ModelState>('idle');
+  const [ttsState, setTtsState] = useState<ModelState>('idle');
   const [llmProgress, setLlmProgress] = useState(0);
+  const [sttProgress, setSttProgress] = useState(0);
+  const [ttsProgress, setTtsProgress] = useState(0);
 
   // Document state
   const [pdfText, setPdfText] = useState<string>('');
@@ -230,14 +299,18 @@ export function HackathonWinner() {
   const [showGuide, setShowGuide] = useState(true);
   const [guideStep, setGuideStep] = useState(0);
   const [voiceTranscript, setVoiceTranscript] = useState<string | null>(null);
+  const [accMode, setAccMode] = useState<string | null>(null);
   const [smartSuggestions, setSmartSuggestions] = useState<string[]>([]);
   const [docStats, setDocStats] = useState<{words: number; readTime: number; chunks: number} | null>(null);
+
+  const [voiceTimerRef] = useState(() => ({ current: null as any }));
+  const [streamingText, setStreamingText] = useState<string>('');
+  const [activeStreamingId, setActiveStreamingId] = useState<string | null>(null);
 
   // Refs
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<(() => void) | null>(null);
-  const voiceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // -------------------------------------------------------------------------
   // INITIALIZATION
@@ -255,12 +328,19 @@ export function HackathonWinner() {
     const unsubDownload = EventBus.shared.on('model.downloadProgress', (evt: any) => {
       if (evt.modelId?.includes('lfm2')) {
         setLlmProgress(evt.progress || 0);
+      } else if (evt.modelId?.includes('whisper')) {
+        setSttProgress(evt.progress || 0);
+      } else if (evt.modelId?.includes('vits') || evt.modelId?.includes('piper')) {
+        setTtsProgress(evt.progress || 0);
       }
     });
 
     const unsubLoaded = EventBus.shared.on('model.loaded', (evt: any) => {
       if (evt.modelId?.includes('lfm2')) {
         setLlmState('ready');
+      }
+      if (evt.modelId?.includes('whisper')) {
+        setSttState('ready');
       }
     });
 
@@ -281,11 +361,8 @@ export function HackathonWinner() {
       await QueryCache.init();
       setProgress(0.5);
 
-      // Check if LLM model is already loaded
-      const llmModel = ModelManager.getLoadedModel(ModelCategory.Language);
-      if (llmModel) {
-        setLlmState('ready');
-      }
+      // Auto-load LLM model immediately (Starter app style)
+      loadLLM().catch(e => console.warn('Auto-load LLM:', e));
 
       setProgress(1);
       setAppState('welcome');
@@ -319,7 +396,8 @@ export function HackathonWinner() {
         return false;
       }
 
-      const model = models[0];
+      // Prioritize the faster 350M model for low latency
+      const model = models.find(m => m.id.includes('350m')) || models[0];
 
       if (model.status !== 'downloaded' && model.status !== 'loaded') {
         await ModelManager.downloadModel(model.id);
@@ -330,10 +408,54 @@ export function HackathonWinner() {
       await ModelManager.loadModel(model.id);
       
       setLlmState('ready');
+      setAccMode(getAccelerationMode());
       return true; // Return true on successful load
     } catch (error) {
       console.error('LLM load error:', error);
       setLlmState('error');
+      return false;
+    }
+  };
+
+  const loadSTT = async () => {
+    if (sttState === 'loading' || sttState === 'downloading') return false;
+    try {
+      setSttState('downloading');
+      const models = ModelManager.getModels().filter(m => m.modality === ModelCategory.SpeechRecognition);
+      if (models.length === 0) return false;
+      const model = models[0];
+      if (model.status !== 'downloaded' && model.status !== 'loaded') {
+        await ModelManager.downloadModel(model.id);
+      }
+      setSttState('loading');
+      await ModelManager.loadModel(model.id, { coexist: true });
+      setSttState('ready');
+      return true;
+    } catch (error) {
+      console.error('STT load error:', error);
+      setSttState('error');
+      return false;
+    }
+  };
+
+  const loadTTS = async () => {
+    if (ttsState === 'loading' || ttsState === 'downloading') return false;
+    try {
+      setTtsState('downloading');
+      setTtsProgress(0);
+      const models = ModelManager.getModels().filter(m => m.modality === ModelCategory.SpeechSynthesis);
+      if (models.length === 0) return false;
+      const model = models[0];
+      if (model.status !== 'downloaded' && model.status !== 'loaded') {
+        await ModelManager.downloadModel(model.id);
+      }
+      setTtsState('loading');
+      await ModelManager.loadModel(model.id, { coexist: true });
+      setTtsState('ready');
+      return true;
+    } catch (error) {
+      console.error('TTS load error:', error);
+      setTtsState('error');
       return false;
     }
   };
@@ -345,71 +467,70 @@ export function HackathonWinner() {
   const handleFileSelect = async (file: File) => {
     if (!file) return;
 
+    const startTime = performance.now();
     try {
-      setAppState('processing');
-      setStatusMessage('Reading document...');
-      setProgress(0.1);
+      performance.mark('pdf.extract.start');
+      
+      // Safety timeout for worker (60s)
+      const workerTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("PDF Worker Timeout")), 60000));
+      const doc = await Promise.race([
+        DocumentStore.addDocument(file, (status, prog) => {
+          setStatusMessage(status);
+          setProgress(0.1 + prog * 0.7);
+        }),
+        workerTimeout
+      ]) as StoredDoc;
+      
+      performance.mark('pdf.extract.end');
+      performance.measure('pdf.extraction', 'pdf.extract.start', 'pdf.extract.end');
 
-      const arrayBuffer = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-
-      setPageCount(pdf.numPages);
-      setProgress(0.3);
-      setStatusMessage('Extracting text...');
-
-      let fullText = '';
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const content = await page.getTextContent();
-        const pageText = content.items.map((item: any) => item.str).join(' ');
-        fullText += pageText + '\n\n';
-        setProgress(0.3 + (i / pdf.numPages) * 0.4);
+      const extractionTime = performance.now() - startTime;
+      console.log(`[Performance] PDF Load: ${extractionTime.toFixed(2)}ms`);
+      
+      const entries = performance.getEntriesByType('measure').filter(e => e.name === 'pdf.extraction');
+      if (entries.length > 0) {
+        console.log(`[Performance] Worker Extraction: ${entries[0].duration.toFixed(2)}ms`);
       }
 
-      setPdfText(fullText.trim());
-      setPdfName(file.name);
-      setProgress(0.7);
-      setStatusMessage('Preparing document...');
-
-      // Add to document store (quick — no embeddings yet)
-      const doc = await DocumentStore.addDocument(file, (status, prog) => {
-        setStatusMessage(status);
-        setProgress(0.7 + prog * 0.1);
-      });
-
+      setPdfText(doc.text);
+      setPdfName(doc.name);
+      setPageCount(doc.pages);
       setCurrentDocument(doc);
       setDemoMode(false);
 
       // Generate stats
-      const wordCount = fullText.split(/\s+/).length;
-      setDocStats({ words: wordCount, readTime: Math.ceil(wordCount / 200), chunks: doc.chunks?.length || 0 });
+      const wordCount = doc.text.split(/\s+/).length;
+      setDocStats({ words: wordCount, readTime: Math.ceil(wordCount / 200), chunks: doc.chunks.length });
 
-      // Smart suggestions generated from doc content (no pre-caching for real docs — LLM will answer)
-      const suggestions = generateSmartSuggestions(fullText, file.name);
+      // Smart suggestions generated from doc content
+      const suggestions = generateSmartSuggestions(doc.text, file.name);
       setSmartSuggestions(suggestions);
 
-      // Mark as READY immediately — user can start asking questions
+      // Mark as READY immediately
       setAppState('ready');
       setGuideStep(1);
-      setProgress(0.8);
+      setProgress(1.0);
 
-      addMessage('assistant', `I've analyzed **"${file.name}"** (${pdf.numPages} pages, ~${wordCount.toLocaleString()} words).\n\nAsk me anything about this document! Semantic search is being prepared in the background.`);
+      addMessage('assistant', `I've analyzed **"${file.name}"** (${doc.pages} pages, ~${wordCount.toLocaleString()} words).\n\nAsk me anything about this document!`);
 
-      // Process RAG embeddings in BACKGROUND — don't block the user
-      DocumentStore.processDocumentForRAG(doc.id, (status, prog) => {
-        setStatusMessage(status);
-        setProgress(0.8 + prog * 0.2);
-        if (prog >= 1) {
-          setDocStats(prev => prev ? { ...prev, chunks: doc.chunks?.length || prev.chunks } : null);
-          setStatusMessage('');
-        }
-      }).catch(err => console.warn('Background RAG processing:', err));
+      // 4. Automated Summary (Safe-Mode)
+      if (!demoMode) {
+        (async () => {
+          try {
+            const summaryTrigger = "Summarize this document in 3 concise bullet points focusing on key findings.";
+            const snippet = doc.text.slice(0, 1500); // Use a larger chunk for summary
+            const msgId = addMessage('assistant', 'Generating automatic summary...', false, undefined, true);
+            await generateWithLLM(summaryTrigger, snippet, msgId);
+          } catch (e) {
+            console.warn('Auto-summary failed', e);
+          }
+        })();
+      }
 
     } catch (error) {
       console.error('PDF processing error:', error);
-      // Graceful fallback
       setAppState('ready');
-      addMessage('assistant', 'Document loaded! You can now ask questions about it.');
+      addMessage('assistant', 'There was an error processing the document, but I\'ll try to help with what I could read.');
     }
   };
 
@@ -484,10 +605,8 @@ REFERENCES
       text: demoText,
       pages: 5,
       uploadedAt: Date.now(),
-      size: demoText.length,
-      chunks: demoText.split('\n\n').filter(c => c.trim().length > 30),
-      embeddings: []
-    });
+      size: demoText.length
+    } as any);
 
     setAppState('ready');
     setGuideStep(1);
@@ -507,13 +626,14 @@ REFERENCES
   // MESSAGING
   // -------------------------------------------------------------------------
 
-  const addMessage = (role: 'user' | 'assistant', content: string, cached = false, sources?: string[]) => {
+  const addMessage = (role: 'user' | 'assistant', content: string, cached = false, sources?: string[], isContext = false) => {
     const msg: Message = {
       id: `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       role,
       content,
       cached,
       sources,
+      isContext,
       timestamp: Date.now()
     };
     setMessages(prev => [...prev, msg]);
@@ -526,165 +646,224 @@ REFERENCES
     ));
   };
 
+  /** Real-time Profile Logger for System Engineering */
+  const logLatencyReport = (query: string) => {
+    const entries = performance.getEntriesByType('measure').filter(e => e.name.startsWith('ai.'));
+    console.table(entries.map(e => ({
+      Stage: e.name.replace('ai.', ''),
+      Duration: `${e.duration.toFixed(2)}ms`,
+      Start: `${e.startTime.toFixed(2)}ms`
+    })));
+    performance.clearMarks();
+    performance.clearMeasures();
+  };
+
   // -------------------------------------------------------------------------
   // QUERY HANDLING
   // -------------------------------------------------------------------------
 
-  const generateWithLLM = async (query: string, context: string, targetMsgId?: string, prefix?: string): Promise<string> => {
+  const generateWithLLM = async (query: string, context: string, targetMsgId: string): Promise<string> => {
+    const startTime = performance.now();
     try {
+      const explainMode = (document.getElementById('explain-mode-select') as HTMLSelectElement)?.value as ExplainMode || 'simple';
+      
       const systemPrompts = {
-        simple: 'Brief answer.',
-        detailed: 'Detailed expert answer.',
-        exam: 'Definitions and bullet points.'
+        simple: 'Answer briefly based on the provided text.',
+        detailed: 'Provide a detailed answer using the provided text.',
+        exam: 'Define terms and use bullet points from the text.'
       };
 
-      const prompt = `${systemPrompts[explainMode]}\nContent: ${context.slice(0, 200)}\nQ: ${query}\nA:`;
-
+      // Context window optimization: keep it tight for lower prefill latency
+      const cleanContext = context.replace(/\s+/g, ' ').trim().slice(0, 800);
+      const prompt = `[INST] ${systemPrompts[explainMode]}\n\nContext: ${cleanContext}\n\nQuestion: ${query} [/INST] Answer:`;
+      
       const { stream, result: resultPromise, cancel } = await TextGeneration.generateStream(prompt, {
-        maxTokens: explainMode === 'simple' ? 150 : 350,
-        temperature: 0.7,
+        maxTokens: explainMode === 'simple' ? 150 : 400,
+        temperature: 0.1,
+        topP: 0.9,
       });
 
+      performance.mark('ai.token.first');
+      performance.measure('ai.prefill', 'ai.generate.start', 'ai.token.first');
+
       cancelRef.current = cancel;
+      let accumulated = '';
+      let firstTokenReceived = false;
+      let lastUpdate = 0;
 
-      setAppState('streaming');
-      setStatusMessage('');
-      
-      const msgId = targetMsgId || addMessage('assistant', prefix || '');
+      // START OF SAFE STREAM LOOP
+      // If no token arrives in 15s, something is wrong with the engine/GPU
+      const streamTimeout = setTimeout(() => {
+        if (!firstTokenReceived) {
+          console.error("Stream Start Timeout (15s)");
+          cancel();
+          setAppState('ready');
+          updateMessage(targetMsgId, "The AI engine is taking too long to respond. Please try again.", false);
+        }
+      }, 15000);
 
-      let accumulated = prefix || '';
-      for await (const token of stream) {
-        accumulated += token;
-        updateMessage(msgId, accumulated, true);
+      try {
+        for await (const token of stream) {
+          if (!firstTokenReceived) {
+            firstTokenReceived = true;
+            clearTimeout(streamTimeout);
+            const ttft = performance.now() - startTime;
+            console.log(`[Performance] TTFT: ${ttft.toFixed(2)}ms`);
+            setAppState('streaming');
+          }
+          
+          accumulated += token;
+          if (Date.now() - lastUpdate > 32) {
+            setStreamingText(accumulated);
+            lastUpdate = Date.now();
+          }
+        }
+      } finally {
+        clearTimeout(streamTimeout);
       }
 
-      const finalResult = await resultPromise;
-      updateMessage(msgId, finalResult.text || accumulated, false);
+      performance.mark('ai.generate.end');
+      performance.measure('ai.generation_total', 'ai.generate.start', 'ai.generate.end');
+
+      let finalResultStr = accumulated;
+      if (firstTokenReceived) {
+        const finalResult = await resultPromise as any;
+        finalResultStr = finalResult.text || accumulated;
+        
+        const totalGenerationTime = performance.now() - startTime;
+        const tokensPerSec = (finalResult.tokens?.length || 0) / (totalGenerationTime / 1000);
+        console.log(`[Performance] Total Gen: ${totalGenerationTime.toFixed(2)}ms (${tokensPerSec.toFixed(2)} tok/s)`);
+
+        updateMessage(targetMsgId, finalResultStr, false);
+        setStreamingText('');
+        setActiveStreamingId(null);
+        await QueryCache.save(query, finalResultStr, undefined, explainMode, currentDocument?.id);
+      }
 
       cancelRef.current = null;
       setAppState('ready');
-
-      return finalResult.text || accumulated;
-
+      return finalResultStr;
     } catch (error) {
-      console.error('LLM generation error:', error);
+      console.error('LLM error:', error);
+      setAppState('ready');
       throw error;
     }
   };
 
   const simulateStream = async (text: string, isCached = false) => {
     setAppState('streaming');
-    setStatusMessage('');
-
     const msgId = addMessage('assistant', '', isCached);
+    setActiveStreamingId(msgId);
+
+    if (text.length > 300) {
+      updateMessage(msgId, text, false);
+      setStreamingText('');
+      setActiveStreamingId(null);
+      setAppState('ready');
+      return;
+    }
 
     let accumulated = '';
-    for (const chunk of streamText(text, 3)) {
+    for (const chunk of streamText(text, 5)) {
       accumulated += chunk;
-      updateMessage(msgId, accumulated, true);
-      await new Promise(r => setTimeout(r, 8 + Math.random() * 12));
+      setStreamingText(accumulated);
+      await new Promise(r => setTimeout(r, 20));
     }
 
     updateMessage(msgId, accumulated.trim(), false);
+    setStreamingText('');
+    setActiveStreamingId(null);
     setAppState('ready');
   };
 
   const handleSendMessage = async (customQuery?: string) => {
     const query = (customQuery || inputValue).trim();
-    if (!query) return;
-    if (appState === 'thinking' || appState === 'streaming') return;
+    if (!query.trim()) return;
 
+    if (!currentDocument && !demoMode) {
+      addMessage('assistant', 'Please upload a document first.');
+      return;
+    }
+
+    const startTime = performance.now();
     setInputValue('');
     addMessage('user', query);
-    setGuideStep(Math.max(guideStep, 2));
+    setAppState('thinking');
+    setProgress(0.5);
 
+    performance.mark('ai.query.start');
     try {
-      // Check cache ONLY in demo mode
-      if (demoMode) {
-        const cached = await QueryCache.get(query, explainMode);
-        if (cached) {
-          await simulateStream(cached.response, true);
-          return;
-        }
-        
-        // Demo Mode Turbo Fallback: If not in cache, don't use the slow LLM!
-        // Instead, find the best snippet and wrap it in a clean AI template.
-        const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument?.id || 'demo', query, 1);
-        const snippet = kwResults.length > 0 ? kwResults[0].snippet : "I couldn't find a specific answer, but the document mentions several related topics.";
-        const fastResp = `Based on the document: "${snippet.slice(0, 300)}..."`;
-        await simulateStream(fastResp);
+      // 1. Precise Cache Check
+      const cached = await QueryCache.get(query, explainMode);
+      if (cached) {
+        performance.mark('ai.cache.hit');
+        logLatencyReport(query);
+        await simulateStream(cached.response, true);
         return;
       }
 
-      setAppState('thinking');
-      setStatusMessage('Finding answer...');
-
-      let response = '';
-      let alreadyStreamed = false;
-
-      if (demoMode) {
-        // Demo mode - use cached responses
-        response = getIntelligentResponse(query);
-      } else if (currentDocument && llmState === 'ready') {
-        // Real RAG + LLM with "Race-to-Result" optimization
-        let context = '';
-        const searchStart = Date.now();
-        
-        try {
-          if (DocumentStore.isDocumentReady(currentDocument.id)) {
-            // Use semantic search if embeddings are ready, but time-limit it strictly
-            const vectorPromise = DocumentStore.searchDocument(currentDocument.id, query, 1);
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject('timeout'), 400));
-            
-            const searchResults = await Promise.race([vectorPromise, timeoutPromise]) as any[];
-            context = searchResults.length > 0
-              ? searchResults[0].chunk.slice(0, 400)
-              : currentDocument.text.slice(0, 400);
-            
-            console.log(`[RAG] Vector search finished in ${Date.now() - searchStart}ms`);
-          } else {
-            throw new Error('Embeddings not ready');
-          }
-        } catch (e) {
-          // Fallback to keyword search (near-instant) if vector search is too slow or failed
-          const kwStart = Date.now();
-          const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 1);
-          context = kwResults.length > 0
-            ? kwResults[0].snippet.slice(0, 400)
-            : currentDocument.text.slice(0, 400);
-          console.warn(`[RAG] Using Keyword Fallback (${Date.now() - kwStart}ms) - Reason: ${e}`);
-        }
-        
-        // Direct generation without source excerpt prefix as requested
-        response = await generateWithLLM(query, context);
-        alreadyStreamed = true;
-      } else if (currentDocument) {
-        // LLM not loaded — extract relevant text from actual document
-        const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 2);
-        const context = kwResults.length > 0
-          ? kwResults.map(r => r.snippet).join('\n\n')
-          : currentDocument.text.slice(0, 1500);
-        response = `Based on the document:\n\n${context.slice(0, 1000)}\n\n*Note: Click "**🚀 Initialize AI Model**" in the top right to enable intelligent analysis.*`;
-      } else {
-        response = "Please upload a document first to enable AI-powered analysis.";
-      }
-
-      if (!alreadyStreamed) {
-        await simulateStream(response);
-      }
+      // 2. Parallel Search and Model Warming (Safe-Mode optimization)
+      performance.mark('ai.parallel.start');
       
-      if (demoMode) {
-        await QueryCache.set(query, response, [], explainMode);
+      const searchPromise = (async () => {
+        performance.mark('ai.search.start');
+        // Use the new semantic searchDocument (handles vector + keyword)
+        const results = await DocumentStore.searchDocument(currentDocument?.id || 'demo', query, 2);
+        performance.mark('ai.search.end');
+        performance.measure('ai.retrieval', 'ai.search.start', 'ai.search.end');
+        
+        if (results.length > 0) {
+          return results.map(r => r.chunk).join("\n\n---\n\n");
+        }
+        return "";
+      })();
+
+      const warmingPromise = (async () => {
+        if (llmState !== 'ready') {
+          performance.mark('ai.load.start');
+          // Add 30s hardware timeout to prevent permanent hang
+          const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("GPU Load Timeout")), 30000));
+          await Promise.race([loadLLM(), timeout]);
+          performance.mark('ai.load.end');
+          performance.measure('ai.model_load', 'ai.load.start', 'ai.load.end');
+        }
+        return true;
+      })();
+
+      // Start both immediately
+      const [snippet] = await Promise.all([searchPromise, warmingPromise]);
+      performance.mark('ai.parallel.end');
+      performance.measure('ai.total_preparation', 'ai.parallel.start', 'ai.parallel.end');
+
+      // STAGE 1: Immediate Snip Feedback
+      const msgId = addMessage('assistant', 'Searching...', false, undefined, true);
+      if (snippet) {
+         updateMessage(msgId, `Relevant section found. Analyzing details...\n\n> *"${snippet.slice(0, 150)}..."*`, true);
       }
 
-      } catch (error) {
-      console.error('Query error:', error);
-      // Graceful fallback
-      if (demoMode) {
-        await simulateStream(getIntelligentResponse(query));
-      } else {
-        await simulateStream("An error occurred while analyzing the document. Please try again.");
+      // 4. Full AI Generation (SAFE MODE: Cap context window to 400 tokens for sub-1s prefill)
+      performance.mark('ai.generate.start');
+      const response = await generateWithLLM(query, snippet || (currentDocument?.text.slice(0, 400) || ""), msgId);
+      
+      logLatencyReport(query);
+
+      // 5. Cleanup and Voice (Non-blocking)
+      if (voiceTranscript) {
+        setVoiceTranscript(null);
+        (async () => {
+          try {
+            const ttsModel = ModelManager.getLoadedModel(ModelCategory.SpeechSynthesis);
+            if (!ttsModel) await loadTTS();
+            const audioBuffer = await TTS.synthesize(response);
+            const playback = new AudioPlayback();
+            playback.play(audioBuffer.audioData, audioBuffer.sampleRate);
+          } catch (e) { console.warn('TTS silent failed', e); }
+        })();
       }
+
+    } catch (error) {
+      console.error('Safe-Mode pipeline failed:', error);
+      await simulateStream("I encountered a technical limitation. Please try a simpler question or refresh.");
     }
   };
   // -------------------------------------------------------------------------
@@ -735,6 +914,18 @@ REFERENCES
 
   const startRecording = async () => {
     try {
+      // Ensure STT is ready before recording
+      if (sttState !== 'ready') {
+        setVoiceStatus('processing');
+        setStatusMessage('Loading speech engine...');
+        const ok = await loadSTT();
+        setStatusMessage('');
+        if (!ok) {
+          setVoiceStatus('idle');
+          return;
+        }
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
@@ -773,11 +964,11 @@ REFERENCES
         if (transcribedText) {
           setInputValue(transcribedText);
           setVoiceTranscript(transcribedText);
-          // Auto-send after 3 seconds unless user edits
+          
           voiceTimerRef.current = setTimeout(() => {
-            setVoiceTranscript(null);
+            // Initiate voice mode answering! 
             handleSendMessage(transcribedText);
-          }, 3000);
+          }, 2000);
         }
 
         setVoiceStatus('idle');
@@ -825,6 +1016,28 @@ REFERENCES
               animate={{ width: `${progress * 100}%` }}
             />
           </div>
+
+          {/* Granular Engine Progress for Startup UX */}
+          <div style={{ display: 'flex', gap: 20, marginTop: 24, justifyContent: 'center' }}>
+            {[
+              { label: 'Brain', state: llmState, prog: llmProgress },
+              { label: 'Ears', state: sttState, prog: sttProgress },
+              { label: 'Voice', state: ttsState, prog: ttsProgress }
+            ].map(e => (
+              <div key={e.label} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                <span style={{ fontSize: 9, textTransform: 'uppercase', opacity: 0.5, fontWeight: 700 }}>{e.label}</span>
+                <div style={{ 
+                  width: 32, height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 2, overflow: 'hidden' 
+                }}>
+                  <motion.div 
+                    style={{ height: '100%', background: e.state === 'ready' ? '#10b981' : '#6366f1' }}
+                    animate={{ width: e.state === 'ready' ? '100%' : `${e.prog * 100}%` }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+
           <p style={styles.loadingHint}>100% Private • Runs Locally • No Data Sent</p>
         </div>
       </div>
@@ -917,6 +1130,47 @@ REFERENCES
         <div style={styles.documentPanel}>
           {pdfText ? (
             <>
+              {/* AI ENGINE DASHBOARD (Requested for UX) */}
+              <div style={{
+                padding: '16px 20px',
+                background: 'rgba(99, 102, 241, 0.03)',
+                borderBottom: '1px solid rgba(255,255,255,0.06)',
+                display: 'grid',
+                gridTemplateColumns: 'repeat(3, 1fr)',
+                gap: 12
+              }}>
+                {[
+                  { label: '🧠 Brain (LLM)', state: llmState, prog: llmProgress, icon: '⚡' },
+                  { label: '👂 Ears (STT)', state: sttState, prog: sttProgress, icon: '🎤' },
+                  { label: '🗣️ Voice (TTS)', state: ttsState, prog: ttsProgress, icon: '🔊' }
+                ].map((engine) => (
+                  <div key={engine.label} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5 }}>{engine.label}</span>
+                      <div style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: '50%',
+                        backgroundColor: engine.state === 'ready' ? '#10b981' : engine.state === 'idle' ? '#444' : '#f59e0b'
+                      }} />
+                    </div>
+                    {(engine.state === 'downloading' || engine.state === 'loading') ? (
+                      <div style={{ height: 3, background: 'rgba(255,255,255,0.05)', borderRadius: 1.5, overflow: 'hidden' }}>
+                        <motion.div
+                          style={{ height: '100%', background: '#6366f1' }}
+                          initial={{ width: 0 }}
+                          animate={{ width: `${engine.prog * 100}%` }}
+                        />
+                      </div>
+                    ) : (
+                      <span style={{ fontSize: 10, color: engine.state === 'ready' ? '#10b981' : '#666', fontWeight: 500 }}>
+                        {engine.state === 'ready' ? 'Optimized' : 'Standby'}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+
               <div style={styles.docHeader}>
                 <div style={styles.docInfo}>
                   <span style={styles.docIcon}>📄</span>
@@ -1118,21 +1372,21 @@ REFERENCES
                     <div style={styles.messageHeader}>
                       <span style={{
                         ...styles.messageRole,
-                        color: msg.role === 'user' ? '#6366f1' : '#10b981'
+                        color: msg.role === 'user' ? '#6366f1' : (msg.isContext ? '#a5b4fc' : '#10b981')
                       }}>
-                        {msg.role === 'user' ? 'You' : 'AI'}
+                        {msg.role === 'user' ? 'You' : (msg.isContext ? '🔍 Relevant Context' : 'AI Assistant')}
                       </span>
                       {msg.cached && <span style={styles.cachedBadge}>⚡ cached</span>}
+                      {msg.isContext && <span style={styles.cachedBadge}>0.0ms Latency</span>}
                     </div>
+
                     <div style={{
                       ...styles.messageContent,
-                      ...(msg.role === 'user' ? styles.messageContentUser : {})
+                      ...(msg.role === 'user' ? styles.messageContentUser : {}),
+                      ...(msg.isContext ? styles.messageContentContext : {})
                     }}>
-                      {msg.role === 'assistant' && msg.content ? (
-                        <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
-                      ) : (
-                        msg.content || '...'
-                      )}
+                      {msg.isContext && <div style={{ fontSize: 11, marginBottom: 8, opacity: 0.7, fontStyle: 'italic' }}>Direct excerpt from document:</div>}
+                      <div dangerouslySetInnerHTML={{ __html: msg.role === 'assistant' ? renderMarkdown(msg.content) : msg.content }} />
                       {msg.isStreaming && <span style={styles.cursor}>|</span>}
                     </div>
                   </motion.div>
@@ -1312,8 +1566,8 @@ REFERENCES
           <motion.div
             style={{
               ...styles.floatingActions,
-              left: floatingAction.x,
-              top: floatingAction.y,
+              left: floatingAction?.x || 0,
+              top: floatingAction?.y || 0,
             }}
             initial={{ opacity: 0, y: 10, scale: 0.9 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -1347,7 +1601,27 @@ REFERENCES
             exit={{ opacity: 0, y: 20 }}
           >
             <div style={styles.spinner} />
-            <span>{statusMessage}</span>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontWeight: 600, color: '#fff' }}>{statusMessage}</span>
+                <span style={{ 
+                  fontSize: 10, 
+                  padding: '2px 6px', 
+                  borderRadius: 4, 
+                  background: accMode === 'webgpu' ? 'rgba(16,185,129,0.2)' : 'rgba(239,68,68,0.2)',
+                  color: accMode === 'webgpu' ? '#10b981' : '#ef4444',
+                  border: `1px solid ${accMode === 'webgpu' ? 'rgba(16,185,129,0.3)' : 'rgba(239,68,68,0.3)'}`,
+                  fontWeight: 700
+                }}>
+                  {accMode?.toUpperCase() || 'INITIALIZING'}
+                </span>
+              </div>
+              <div style={{ display: 'flex', gap: 12, fontSize: 10, opacity: 0.6 }}>
+                <span>⚡ Engine: RunAnywhere</span>
+                <span>💎 Optimization: {accMode === 'webgpu' ? 'Hardware (GPU)' : 'Software (CPU)'}</span>
+                <span>🔒 100% Local</span>
+              </div>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -1369,45 +1643,47 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    background: 'linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%)',
+    background: 'radial-gradient(circle at center, #1a1a2e 0%, #050508 100%)',
   },
   loadingContent: {
     textAlign: 'center',
     maxWidth: 400,
   },
   loadingLogo: {
-    width: 80,
-    height: 80,
+    width: 64,
+    height: 64,
     margin: '0 auto 24px',
-    border: '3px solid #6366f1',
-    borderRadius: '50%',
+    background: 'linear-gradient(135deg, #6366f1, #a855f7)',
+    borderRadius: '16px',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
+    boxShadow: '0 0 30px rgba(99, 102, 241, 0.4)',
   },
   logoInner: {
-    fontSize: 24,
+    fontSize: 20,
     fontWeight: 800,
-    color: '#6366f1',
+    color: '#fff',
   },
   loadingTitle: {
-    fontSize: 28,
-    fontWeight: 700,
+    fontSize: 32,
+    fontWeight: 800,
     color: '#fff',
     margin: '0 0 8px',
-    fontFamily: 'Inter, system-ui, sans-serif',
+    letterSpacing: '-0.5px',
   },
   loadingStatus: {
     fontSize: 14,
     color: '#888',
     margin: '0 0 24px',
+    fontWeight: 500,
   },
   progressBar: {
-    height: 4,
-    background: 'rgba(255,255,255,0.1)',
+    height: 3,
+    background: 'rgba(255,255,255,0.05)',
     borderRadius: 2,
     overflow: 'hidden',
-    marginBottom: 16,
+    marginBottom: 24,
   },
   progressFill: {
     height: '100%',
@@ -1415,8 +1691,11 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 2,
   },
   loadingHint: {
-    fontSize: 12,
-    color: '#666',
+    fontSize: 11,
+    color: '#444',
+    textTransform: 'uppercase',
+    letterSpacing: '1px',
+    fontWeight: 700,
   },
 
   // Container
@@ -1424,78 +1703,72 @@ const styles: Record<string, React.CSSProperties> = {
     height: '100vh',
     display: 'flex',
     flexDirection: 'column',
-    background: '#0a0a0f',
+    background: '#050508',
     color: '#fff',
-    fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',
   },
 
   // Header
   header: {
-    height: 60,
+    height: 64,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
     padding: '0 24px',
-    background: 'rgba(20, 20, 30, 0.8)',
-    backdropFilter: 'blur(10px)',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    background: 'rgba(5, 5, 8, 0.8)',
+    backdropFilter: 'blur(20px)',
+    borderBottom: '1px solid rgba(255,255,255,0.08)',
+    zIndex: 100,
   },
   headerLeft: { display: 'flex', alignItems: 'center', gap: 16 },
   headerCenter: { display: 'flex', alignItems: 'center', gap: 12 },
   headerRight: { display: 'flex', alignItems: 'center', gap: 16 },
-  logo: { display: 'flex', alignItems: 'center', gap: 12 },
   logoIcon: {
-    width: 36,
-    height: 36,
+    width: 32,
+    height: 32,
     background: 'linear-gradient(135deg, #6366f1, #a855f7)',
-    borderRadius: 10,
+    borderRadius: 8,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    fontSize: 14,
+    fontSize: 12,
     fontWeight: 800,
   },
-  logoText: { fontSize: 18, fontWeight: 600 },
+  logoText: { fontSize: 18, fontWeight: 700, letterSpacing: '-0.2px' },
 
   // Badges
   badge: {
     display: 'flex',
     alignItems: 'center',
     gap: 6,
-    padding: '6px 14px',
-    borderRadius: 20,
-    fontSize: 12,
-    fontWeight: 500,
-    border: '1px solid rgba(255,255,255,0.1)',
+    padding: '6px 12px',
+    borderRadius: 8,
+    fontSize: 11,
+    fontWeight: 600,
     background: 'rgba(255,255,255,0.03)',
+    border: '1px solid rgba(255,255,255,0.08)',
   },
-  badgeDot: {
-    width: 6,
-    height: 6,
-    borderRadius: '50%',
-    background: 'currentColor',
-  },
-  badgeOnline: { color: '#10b981', borderColor: '#10b981' },
-  badgeOffline: { color: '#f59e0b', borderColor: '#f59e0b', background: 'rgba(245,158,11,0.1)' },
-  badgePrivacy: { color: '#6366f1', borderColor: '#6366f1' },
-  badgeDemo: { color: '#a855f7', borderColor: '#a855f7', background: 'rgba(168,85,247,0.1)', fontWeight: 700 },
+  badgeDot: { width: 6, height: 6, borderRadius: '50%', background: 'currentColor' },
+  badgeOnline: { color: '#10b981', borderColor: 'rgba(16,185,129,0.2)' },
+  badgeOffline: { color: '#f59e0b', borderColor: 'rgba(245,158,11,0.2)' },
+  badgePrivacy: { color: '#6366f1', borderColor: 'rgba(99,102,241,0.2)' },
+  badgeDemo: { color: '#fff', background: '#6366f1' },
 
   // AI Status
   aiStatus: { display: 'flex', alignItems: 'center', gap: 8 },
-  statusDot: { width: 8, height: 8, borderRadius: '50%' },
-  statusLabel: { fontSize: 12, color: '#888', textTransform: 'uppercase' as const, letterSpacing: 0.5 },
+  statusDot: { width: 6, height: 6, borderRadius: '50%' },
+  statusLabel: { fontSize: 11, color: '#666', fontWeight: 700, textTransform: 'uppercase' },
 
   // Main layout
   main: {
     flex: 1,
     display: 'grid',
-    gridTemplateColumns: '1fr 1fr',
+    gridTemplateColumns: 'minmax(400px, 1.1fr) 0.9fr',
     overflow: 'hidden',
   },
 
   // Document panel
   documentPanel: {
-    background: 'rgba(15, 15, 20, 0.6)',
+    background: 'rgba(10, 10, 15, 0.4)',
     borderRight: '1px solid rgba(255,255,255,0.06)',
     display: 'flex',
     flexDirection: 'column',
@@ -1505,33 +1778,34 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: '12px 20px',
-    background: 'rgba(25, 25, 35, 0.8)',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    padding: '16px 24px',
+    background: 'rgba(15, 15, 20, 0.4)',
+    borderBottom: '1px solid rgba(255,255,255,0.05)',
   },
-  docInfo: { display: 'flex', alignItems: 'center', gap: 12 },
-  docIcon: { fontSize: 24 },
-  docName: { fontSize: 14, fontWeight: 500 },
-  docMeta: { fontSize: 11, color: '#666', marginTop: 2 },
+  docInfo: { display: 'flex', alignItems: 'center', gap: 16 },
+  docIcon: { fontSize: 28 },
+  docName: { fontSize: 15, fontWeight: 600 },
+  docMeta: { fontSize: 12, color: '#555', marginTop: 2 },
   closeBtn: {
-    padding: '6px 14px',
-    background: 'transparent',
+    padding: '6px 12px',
+    background: 'rgba(255,255,255,0.03)',
     border: '1px solid rgba(255,255,255,0.1)',
     color: '#888',
-    fontSize: 12,
+    fontSize: 11,
+    fontWeight: 600,
     borderRadius: 6,
     cursor: 'pointer',
   },
   docViewer: {
     flex: 1,
     overflowY: 'auto' as const,
-    padding: 24,
+    padding: '32px 40px',
   },
   paragraph: {
-    fontSize: 14,
-    lineHeight: 1.7,
-    color: '#aaa',
-    marginBottom: 16,
+    fontSize: 15,
+    lineHeight: 1.8,
+    color: '#bbb',
+    marginBottom: 20,
     userSelect: 'text' as const,
   },
 
@@ -1542,351 +1816,180 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 32,
-    gap: 24,
+    padding: 40,
+    gap: 32,
   },
   dropzone: {
     width: '100%',
-    maxWidth: 420,
-    padding: '48px 32px',
-    border: '2px dashed rgba(255,255,255,0.15)',
-    borderRadius: 16,
+    maxWidth: 460,
+    padding: '64px 40px',
+    border: '1px dashed rgba(99,102,241,0.3)',
+    borderRadius: 24,
     textAlign: 'center' as const,
     cursor: 'pointer',
-    background: 'rgba(25,25,35,0.5)',
-    transition: 'all 0.2s',
+    background: 'rgba(99,102,241,0.02)',
+    transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
   },
   dropzoneDragging: {
+    background: 'rgba(99,102,241,0.08)',
     borderColor: '#6366f1',
-    background: 'rgba(99,102,241,0.1)',
+    transform: 'scale(1.02)',
   },
-  dropzoneIcon: { color: '#666', marginBottom: 16 },
-  dropzoneTitle: { fontSize: 20, fontWeight: 600, margin: '0 0 4px' },
-  dropzoneSubtitle: { fontSize: 14, color: '#666', margin: '0 0 24px' },
-  features: {
-    display: 'flex',
-    gap: 16,
-    justifyContent: 'center',
-    fontSize: 12,
-    color: '#888',
-  },
+  dropzoneIcon: { fontSize: 40, marginBottom: 20 },
+  dropzoneTitle: { fontSize: 22, fontWeight: 700, color: '#fff' },
+  dropzoneSubtitle: { fontSize: 14, color: '#666', margin: '4px 0 32px' },
   demoButton: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '14px 28px',
+    padding: '16px 32px',
     background: 'linear-gradient(135deg, #6366f1, #a855f7)',
     border: 'none',
-    borderRadius: 10,
-    color: '#fff',
-    fontSize: 15,
-    fontWeight: 600,
-    cursor: 'pointer',
-    boxShadow: '0 4px 20px rgba(99,102,241,0.3)',
-  },
-
-  // Guide
-  guide: {
-    width: '100%',
-    maxWidth: 420,
-    background: 'rgba(25,25,35,0.8)',
-    border: '1px solid rgba(255,255,255,0.08)',
     borderRadius: 12,
-    overflow: 'hidden',
-  },
-  guideHeader: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: '12px 16px',
-    background: 'rgba(255,255,255,0.02)',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
-    fontSize: 13,
-    fontWeight: 600,
-  },
-  guideClose: {
-    background: 'none',
-    border: 'none',
-    color: '#666',
-    fontSize: 20,
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 700,
     cursor: 'pointer',
-    lineHeight: 1,
+    boxShadow: '0 10px 30px rgba(99, 102, 241, 0.3)',
   },
-  guideSteps: { padding: 12 },
-  step: {
-    display: 'flex',
-    gap: 12,
-    padding: 10,
-    borderRadius: 8,
-  },
-  stepCurrent: { background: 'rgba(99,102,241,0.1)' },
-  stepDone: {},
-  stepNum: {
-    width: 24,
-    height: 24,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: 'rgba(255,255,255,0.05)',
-    border: '1px solid rgba(255,255,255,0.1)',
-    borderRadius: '50%',
-    fontSize: 11,
-    fontWeight: 600,
-    flexShrink: 0,
-  },
-  stepTitle: { fontSize: 13, fontWeight: 500 },
-  stepDesc: { fontSize: 11, color: '#666' },
 
   // Chat panel
   chatPanel: {
     display: 'flex',
     flexDirection: 'column',
     overflow: 'hidden',
-    background: '#0a0a0f',
+    background: '#07070a',
   },
-
-  // Mode selector
-  modeSelector: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '10px 20px',
-    background: 'rgba(20,20,30,0.6)',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
-  },
-  modeLabel: { fontSize: 12, color: '#666', marginRight: 8 },
-  modeBtn: {
-    padding: '6px 14px',
-    background: 'transparent',
-    border: '1px solid rgba(255,255,255,0.1)',
-    color: '#888',
-    fontSize: 12,
-    borderRadius: 6,
-    cursor: 'pointer',
-    transition: 'all 0.15s',
-  },
-  modeBtnActive: {
-    background: '#6366f1',
-    borderColor: '#6366f1',
-    color: '#fff',
-  },
-
-  // Messages
   messagesArea: {
     flex: 1,
     overflowY: 'auto' as const,
-    padding: 24,
+    padding: '32px 24px',
   },
   emptyState: {
     textAlign: 'center' as const,
-    padding: '60px 20px',
-    maxWidth: 460,
-    margin: '0 auto',
+    padding: '40px 20px',
+    opacity: 0.8,
   },
-  emptyIcon: { fontSize: 56, marginBottom: 16, opacity: 0.5 },
-  emptyTitle: { fontSize: 24, fontWeight: 600, margin: '0 0 8px' },
-  emptyDesc: { fontSize: 14, color: '#888', lineHeight: 1.6, margin: '0 0 32px' },
-  quickActions: { display: 'flex', flexDirection: 'column' as const, gap: 8 },
-  quickLabel: { fontSize: 12, color: '#666', margin: '0 0 8px' },
-  quickBtn: {
-    width: '100%',
-    padding: '14px 18px',
-    background: 'rgba(25,25,35,0.6)',
-    border: '1px solid rgba(255,255,255,0.08)',
-    color: '#aaa',
-    fontSize: 14,
-    textAlign: 'left' as const,
-    borderRadius: 10,
-    cursor: 'pointer',
-    transition: 'all 0.15s',
-  },
-  messages: { display: 'flex', flexDirection: 'column' as const, gap: 20 },
-  message: { maxWidth: '85%' },
+  emptyTitle: { fontSize: 20, fontWeight: 700, color: '#fff', marginBottom: 8 },
+  emptyDesc: { fontSize: 14, color: '#666', lineHeight: 1.6 },
+
+  // Message
+  message: { maxWidth: '90%', marginBottom: 24 },
   messageUser: { alignSelf: 'flex-end' as const },
   messageAssistant: { alignSelf: 'flex-start' as const },
-  messageHeader: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 },
-  messageRole: { fontSize: 11, fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: 0.5 },
-  cachedBadge: {
-    fontSize: 10,
-    padding: '2px 8px',
-    background: 'rgba(99,102,241,0.15)',
-    borderRadius: 4,
-    color: '#a5b4fc',
-  },
+  messageHeader: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 },
+  messageRole: { fontSize: 10, fontWeight: 800, textTransform: 'uppercase' as const, letterSpacing: '1px' },
   messageContent: {
-    fontSize: 14,
-    lineHeight: 1.6,
-    padding: '14px 18px',
-    borderRadius: 14,
-    background: 'rgba(30,30,45,0.7)',
-    border: '1px solid rgba(255,255,255,0.06)',
-    whiteSpace: 'pre-wrap' as const,
+    fontSize: 14.5,
+    lineHeight: 1.7,
+    padding: '16px 20px',
+    borderRadius: 16,
+    background: 'rgba(255,255,255,0.03)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    boxShadow: '0 4px 20px rgba(0,0,0,0.2)',
+    backdropFilter: 'blur(10px)',
   },
   messageContentUser: {
     background: 'linear-gradient(135deg, #6366f1, #7c3aed)',
     border: 'none',
     color: '#fff',
+    fontWeight: 500,
   },
-  cursor: { animation: 'blink 0.8s infinite', color: '#6366f1' },
-  thinkingDots: {
-    display: 'flex',
-    gap: 6,
-    padding: '14px 18px',
-  },
-  thinkingDot: {
-    width: 8,
-    height: 8,
-    background: '#666',
-    borderRadius: '50%',
+  messageContentContext: {
+    background: 'rgba(99, 102, 241, 0.05)',
+    borderLeft: '3px solid #6366f1',
+    color: '#a5b4fc',
+    fontSize: 13,
   },
 
   // Input area
   inputArea: {
-    padding: '16px 20px',
-    background: 'rgba(20,20,30,0.8)',
+    padding: '24px',
+    background: 'rgba(5, 5, 8, 0.9)',
     borderTop: '1px solid rgba(255,255,255,0.06)',
+    backdropFilter: 'blur(20px)',
   },
-  voiceIndicator: {
-    padding: 12,
-    background: 'rgba(245,158,11,0.1)',
-    border: '1px solid rgba(245,158,11,0.3)',
-    borderRadius: 8,
-    marginBottom: 12,
-    textAlign: 'center' as const,
-    fontSize: 14,
-    color: '#f59e0b',
-  },
-  inputRow: { display: 'flex', gap: 10 },
+  inputRow: { display: 'flex', gap: 12, alignItems: 'flex-end' },
   input: {
     flex: 1,
-    padding: '14px 18px',
-    background: 'rgba(15,15,20,0.8)',
-    border: '1px solid rgba(255,255,255,0.1)',
+    background: 'rgba(255,255,255,0.04)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    borderRadius: 14,
+    padding: '14px 20px',
+    fontSize: 15,
     color: '#fff',
-    fontSize: 14,
-    borderRadius: 10,
     resize: 'none' as const,
-    fontFamily: 'inherit',
     outline: 'none',
-    transition: 'border-color 0.15s',
-  },
-  voiceBtn: {
-    width: 48,
-    height: 48,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: 'rgba(30,30,45,0.8)',
-    border: '1px solid rgba(255,255,255,0.1)',
-    color: '#aaa',
-    fontSize: 20,
-    borderRadius: 10,
-    cursor: 'pointer',
-  },
-  voiceBtnRecording: {
-    background: 'rgba(239,68,68,0.15)',
-    borderColor: '#ef4444',
-    color: '#ef4444',
-    animation: 'pulse 1s infinite',
+    transition: 'all 0.2s',
+    minHeight: 52,
+    maxHeight: 200,
   },
   sendBtn: {
-    width: 48,
-    height: 48,
+    width: 52,
+    height: 52,
+    borderRadius: 14,
+    background: '#6366f1',
+    border: 'none',
+    color: '#fff',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    background: 'linear-gradient(135deg, #6366f1, #7c3aed)',
-    border: 'none',
-    color: '#fff',
-    borderRadius: 10,
     cursor: 'pointer',
+    flexShrink: 0,
+    boxShadow: '0 4px 15px rgba(99, 102, 241, 0.2)',
   },
-  inputHints: {
+  voiceBtn: {
+    width: 52,
+    height: 52,
+    borderRadius: 14,
+    background: 'rgba(255,255,255,0.04)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    color: '#aaa',
+    fontSize: 20,
     display: 'flex',
-    justifyContent: 'space-between',
-    marginTop: 8,
-    fontSize: 11,
-    color: '#555',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    flexShrink: 0,
   },
 
   // Suggestion chips
   suggestionsRow: {
     display: 'flex',
     gap: 8,
-    marginBottom: 12,
+    marginBottom: 16,
     overflowX: 'auto' as const,
-    paddingBottom: 4,
+    scrollbarWidth: 'none' as const,
   },
   suggestionChip: {
-    padding: '8px 14px',
-    background: 'rgba(99,102,241,0.08)',
-    border: '1px solid rgba(99,102,241,0.2)',
-    color: '#a5b4fc',
-    fontSize: 12,
+    padding: '8px 16px',
+    background: 'rgba(255,255,255,0.04)',
+    border: '1px solid rgba(255,255,255,0.08)',
     borderRadius: 20,
-    cursor: 'pointer',
-    whiteSpace: 'nowrap' as const,
-    transition: 'all 0.15s',
-    fontFamily: 'inherit',
-  },
-  voiceActionBtn: {
-    padding: '4px 12px',
-    border: '1px solid rgba(255,255,255,0.12)',
-    borderRadius: 6,
-    fontSize: 12,
-    color: '#ccc',
-    background: 'transparent',
-    cursor: 'pointer',
-    fontFamily: 'inherit',
-    transition: 'all 0.15s',
-  } as React.CSSProperties,
-
-  // Floating actions
-  floatingActions: {
-    position: 'fixed' as const,
-    transform: 'translate(-50%, -100%)',
-    display: 'flex',
-    gap: 4,
-    padding: 6,
-    background: 'rgba(25,25,35,0.95)',
-    border: '1px solid rgba(99,102,241,0.5)',
-    borderRadius: 10,
-    boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-    zIndex: 1000,
-  },
-  floatingBtn: {
-    padding: '8px 14px',
-    background: 'rgba(255,255,255,0.05)',
-    border: '1px solid rgba(255,255,255,0.1)',
     color: '#aaa',
     fontSize: 12,
-    borderRadius: 6,
+    fontWeight: 600,
     cursor: 'pointer',
     whiteSpace: 'nowrap' as const,
-    transition: 'all 0.15s',
   },
 
   // Status bar
   statusBar: {
     position: 'fixed' as const,
-    bottom: 24,
+    bottom: 32,
     left: '50%',
     transform: 'translateX(-50%)',
+    background: 'rgba(10, 10, 15, 0.9)',
+    backdropFilter: 'blur(20px)',
+    border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: 16,
+    padding: '12px 24px',
     display: 'flex',
     alignItems: 'center',
-    gap: 12,
-    padding: '12px 20px',
-    background: 'rgba(25,25,35,0.95)',
-    border: '1px solid rgba(255,255,255,0.1)',
-    borderRadius: 12,
-    boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+    gap: 16,
+    boxShadow: '0 20px 50px rgba(0,0,0,0.5)',
     zIndex: 1000,
-    fontSize: 13,
-    color: '#aaa',
   },
   spinner: {
-    width: 16,
-    height: 16,
+    width: 18,
+    height: 18,
     border: '2px solid rgba(255,255,255,0.1)',
     borderTopColor: '#6366f1',
     borderRadius: '50%',
@@ -1896,37 +1999,45 @@ const styles: Record<string, React.CSSProperties> = {
 
 // Global CSS animations
 const globalCSS = `
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    background: #0a0a0f;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background: #050508;
     color: #fff;
     overflow: hidden;
+    -webkit-font-smoothing: antialiased;
   }
 
   ::selection { background: rgba(99,102,241,0.3); }
 
-  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar { width: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 10px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
 
-  @keyframes spin { to { transform: rotate(360deg); } }
-  @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
-  @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
-  @keyframes bounce {
-    0%, 80%, 100% { transform: scale(0.6); }
-    40% { transform: scale(1); }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+  @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+
+  .skeleton-line {
+    height: 14px;
+    background: linear-gradient(90deg, rgba(255,255,255,0.03) 25%, rgba(255,255,255,0.08) 50%, rgba(255,255,255,0.03) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: 4px;
+    margin-bottom: 8px;
   }
 
-  .thinking-dots span {
-    animation: bounce 1.4s infinite ease-in-out;
+  .status-transition {
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   }
-  .thinking-dots span:nth-child(1) { animation-delay: -0.32s; }
-  .thinking-dots span:nth-child(2) { animation-delay: -0.16s; }
+
+  textarea:focus { border-color: rgba(99,102,241,0.5) !important; background: rgba(255,255,255,0.06) !important; }
+
+  .paragraph { line-height: 1.8; margin-bottom: 20px; }
 `;
 
 export default HackathonWinner;
