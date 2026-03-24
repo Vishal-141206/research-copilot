@@ -752,9 +752,6 @@ REFERENCES
         setAppState('streaming');
         setStatusMessage('');
 
-        // Small delay for realism (200-350ms)
-        await new Promise(r => setTimeout(r, 200 + Math.random() * 150));
-
         const instantResponse = await PerceptionEngine.getInstantResponse(
           query,
           currentDocument?.id,
@@ -775,7 +772,7 @@ REFERENCES
               updateMessage(msgId, instantResponse.text, false);
               resolve();
             },
-            8 // FASTER: 8ms per word chunk for demo
+            4 // ULTRA FASTER: 4ms per word chunk
           );
         });
 
@@ -790,9 +787,6 @@ REFERENCES
       if (!isDemoDocument && currentDocument) {
         setAppState('streaming');
         setStatusMessage('');
-
-        // Small delay for perceived processing (250-400ms)
-        await new Promise(r => setTimeout(r, 250 + Math.random() * 150));
 
         let responseText: string;
 
@@ -821,7 +815,7 @@ REFERENCES
               updateMessage(msgId, responseText, false);
               resolve();
             },
-            10 // Balanced speed for real documents
+            4 // ULTRA FAST: 4ms per chunk for zero-latency real documents
           );
         });
 
@@ -896,7 +890,7 @@ REFERENCES
           fallbackText,
           (partial) => updateMessage(msgId, partial, true),
           () => { updateMessage(msgId, fallbackText, false); resolve(); },
-          8
+          4 // Match 4ms speed
         );
       });
       setAppState('ready');
@@ -910,19 +904,9 @@ REFERENCES
    * Response format matches PerceptionEngine for consistency:
    * - Opening context phrase
    * - Bullet point insights (3-5)
-   * - Closing suggestion
    */
-  const generateTextExtractionFallback = (text: string, query: string, documentName: string): string => {
+  const generateTextExtractionFallback = (text: string, query: string, _documentName: string): string => {
     const normalizedQuery = query.toLowerCase();
-
-    // Context phrases for AI-like feel (matches PerceptionEngine/DocumentAnalyzer)
-    const contextPhrases = [
-      'Based on the document, here are the key insights:',
-      'After analyzing the content, I found:',
-      'The document reveals the following:',
-      'Here\'s what I found in the document:'
-    ];
-    const opener = contextPhrases[Math.floor(Math.random() * contextPhrases.length)];
 
     // Extract relevant sentences based on query keywords
     const queryWords = normalizedQuery
@@ -930,9 +914,9 @@ REFERENCES
       .filter(w => w.length > 3);
 
     const sentences = text
-      .split(/[.!?]+/)
+      .split(/(?:[.!?]+(?:\s+|$))|(?:\n+)/)
       .map(s => s.trim())
-      .filter(s => s.length > 30 && s.length < 400);
+      .filter(s => s.length >= 15 && s.length < 600);
 
     // Score sentences by keyword match
     const scoredSentences = sentences.map(sentence => {
@@ -951,7 +935,7 @@ REFERENCES
       return { sentence, score };
     });
 
-    // Get top 3-4 relevant sentences
+    // Get top 4 relevant sentences
     const topSentences = scoredSentences
       .sort((a, b) => b.score - a.score)
       .slice(0, 4)
@@ -968,7 +952,7 @@ REFERENCES
       }
     }
 
-    // Format as bullet points (consistent with PerceptionEngine)
+    // Format as bullet points (consistent with PerceptionEngine/DocumentAnalyzer)
     if (uniqueSentences.length > 0) {
       const bullets = uniqueSentences
         .slice(0, 3)
@@ -981,17 +965,37 @@ REFERENCES
           // Ensure ends with period
           return formatted.endsWith('.') ? formatted : formatted + '.';
         })
-        .map(s => `• ${s}`)
+        .map(s => `\u2022 ${s}`)
         .join('\n');
 
-      return `**Key Insights**\n\n${opener}\n\n${bullets}\n\n*Try asking about "summary", "key points", or "methodology" for more specific analysis.*`;
+      return `**Key Insights**\n\nBased on the document, here are the key insights:\n\n${bullets}`;
     }
 
-    // Ultimate fallback: structured excerpt
-    const excerpt = text.slice(0, 350).trim();
-    const cleanExcerpt = excerpt.split(/[.!?]+/).slice(0, 3).join('. ').trim() + '.';
+    // Ultimate fallback: structured excerpt as bullets
+    let excerptSentences = text
+      .split(/(?:[.!?]+(?:\s+|$))|(?:\n+)/)
+      .map(s => s.trim())
+      .filter(s => s.length >= 15 && s.length < 300);
 
-    return `**Document Overview**\n\n${opener}\n\n• ${cleanExcerpt}\n\n*Ask specific questions for better results.*`;
+    // Emergency split if document is one massive unbroken string without punctuation/newlines
+    if (excerptSentences.length === 0) {
+      const words = text.split(/\s+/);
+      excerptSentences = [
+        words.slice(0, 15).join(' '),
+        words.slice(15, 30).join(' '),
+        words.slice(30, 45).join(' ')
+      ].filter(s => s.length > 5);
+    }
+
+    const fallbackBullets = excerptSentences
+      .slice(0, 3)
+      .map(s => {
+        const formatted = s.charAt(0).toUpperCase() + s.slice(1);
+        return `\u2022 ${formatted.endsWith('.') ? formatted : formatted + '.'}`;
+      })
+      .join('\n');
+
+    return `**Key Insights**\n\nBased on the document, here are the key insights:\n\n${fallbackBullets || '• No readable insights could be extracted from this sparse document.'}`;
   };
 
   /**

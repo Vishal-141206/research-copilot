@@ -409,25 +409,44 @@ class PerceptionEngineClass {
     documentText?: string
   ): Promise<string | null> {
     try {
+      let rawSentences: string[] = [];
+
       // Try keyword search first (instant)
       if (documentId) {
         const results = DocumentStore.searchDocumentByKeyword(documentId, query, 2);
         if (results.length > 0) {
-          const snippets = results.map(r => r.snippet).join('\n\n');
-          const compressed = this.compressText(snippets, 400);
-          return `Based on the document:\n\n"${compressed}"\n\n*This is a direct excerpt. AI analysis will provide deeper insights.*`;
+          const snippets = results.map(r => r.snippet).join(' ');
+          rawSentences = snippets.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 20);
         }
       }
 
       // Fallback to document text
-      if (documentText) {
-        const sentences = this.extractTopSentences(documentText, query, 3);
-        if (sentences) {
-          return `Based on the document:\n\n"${sentences}"\n\n*This is a direct excerpt. AI analysis available shortly.*`;
+      if (rawSentences.length === 0 && documentText) {
+        const topText = this.extractTopSentences(documentText, query, 4);
+        if (topText) {
+          rawSentences = topText.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 20);
         }
       }
 
-      return null;
+      if (rawSentences.length === 0) return null;
+
+      // Deduplicate and compress to bullet points
+      const seen = new Set<string>();
+      const bullets: string[] = [];
+      for (const s of rawSentences) {
+        const key = s.toLowerCase().split(/\s+/).slice(0, 5).join(' ');
+        if (!seen.has(key)) {
+          seen.add(key);
+          const words = s.split(/\s+/);
+          let shortened = words.length > 25 ? words.slice(0, 25).join(' ') + '...' : s;
+          shortened = shortened.charAt(0).toUpperCase() + shortened.slice(1);
+          if (!shortened.match(/[.!?]$/)) shortened += '.';
+          bullets.push(`• ${shortened}`);
+        }
+        if (bullets.length >= 3) break;
+      }
+
+      return `**Key Insights**\n\nBased on the document, here are the key insights:\n\n${bullets.join('\n')}`;
     } catch (err) {
       console.warn('[Perception] Excerpt extraction failed:', err);
       return null;
@@ -496,18 +515,19 @@ class PerceptionEngineClass {
   private generateSkeletonResponse(query: string): string {
     const intent = this.detectIntent(query);
 
-    const templates: Record<string, string> = {
-      summarize: "**Analyzing document structure...**\n\nI'm reviewing the key sections to provide a comprehensive summary.",
-      explain: "**Processing your question...**\n\nLet me find the relevant information to explain this clearly.",
-      findings: "**Extracting findings...**\n\nI'm identifying the main results and conclusions.",
-      methodology: "**Reviewing methodology...**\n\nI'm examining the approaches and techniques described.",
-      conclusion: "**Finding conclusions...**\n\nI'm locating the final insights and takeaways.",
-      definitions: "**Gathering definitions...**\n\nI'm compiling the key terms and their meanings.",
-      compare: "**Preparing comparison...**\n\nI'm analyzing the different aspects mentioned.",
-      default: "**Analyzing document...**\n\nI'm searching for the most relevant information to answer your question."
+    const titles: Record<string, string> = {
+      summarize: 'Summary',
+      explain: 'Explanation',
+      findings: 'Key Findings',
+      methodology: 'Methodology',
+      conclusion: 'Conclusions',
+      definitions: 'Key Terms',
+      compare: 'Comparison',
+      default: 'Key Insights'
     };
 
-    return templates[intent || 'default'];
+    const title = titles[intent || 'default'];
+    return `**${title}**\n\nBased on the document, here are the key insights:\n\n• Analyzing relevant sections...\n• Extracting important details...\n• Preparing response...`;
   }
 
   /**

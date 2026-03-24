@@ -65,43 +65,37 @@ const SECTION_PATTERNS = {
   conclusion: /^(conclusion|discussion|summary|future|implication)/i
 };
 
-// AI-like opening phrases for variety
+// Unified AI-like opening phrases — consistent "Based on the document" tone
 const CONTEXT_PHRASES = {
   summary: [
-    'Based on my analysis of this document,',
-    'After reviewing the content,',
-    'The document presents',
-    'This paper explores'
+    'Based on the document, here are the key insights:',
+    'Based on the document, the main points are:',
+    'Based on the document, this is what stands out:'
   ],
   keyPoints: [
-    'The key insights from this document are:',
-    'Here are the main takeaways:',
-    'The document highlights several important points:',
-    'Based on the content, the critical points are:'
+    'Based on the document, here are the key insights:',
+    'Based on the document, the critical points are:',
+    'Based on the document, the main takeaways are:'
   ],
   methodology: [
-    'The approach described in this document involves:',
-    'The methodology centers around:',
-    'The research employs the following approach:',
-    'This document outlines a systematic process:'
+    'Based on the document, the approach involves:',
+    'Based on the document, the methodology is:',
+    'Based on the document, the process described is:'
   ],
   results: [
-    'The document reveals several key findings:',
-    'Based on the analysis, the main outcomes are:',
-    'The evidence presented suggests:',
-    'The key results demonstrate:'
+    'Based on the document, the key findings are:',
+    'Based on the document, the main outcomes are:',
+    'Based on the document, the results show:'
   ],
   explain: [
-    'Based on the document,',
-    'The content indicates that',
-    'According to this document,',
-    'The text explains that'
+    'Based on the document, here is an explanation:',
+    'Based on the document, this is what it describes:',
+    'Based on the document, the relevant details are:'
   ],
   default: [
-    'Here\'s what I found in the document:',
-    'Based on the relevant content:',
-    'The document addresses this as follows:',
-    'From the analysis:'
+    'Based on the document, here are the key insights:',
+    'Based on the document, here is what I found:',
+    'Based on the document, the relevant content is:'
   ]
 };
 
@@ -288,10 +282,9 @@ class DocumentAnalyzerClass {
    */
   private extractSentences(text: string): string[] {
     return text
-      .replace(/\n+/g, ' ')
-      .split(/(?<=[.!?])\s+/)
+      .split(/(?:[.!?]+(?:\s+|$))|(?:\n+)/)
       .map(s => s.trim())
-      .filter(s => s.length > 30 && s.length < 500)
+      .filter(s => s.length >= 15 && s.length < 600)
       .slice(0, 100);
   }
 
@@ -471,41 +464,27 @@ class DocumentAnalyzerClass {
     return this.formatDefaultResponse(analysis, query, documentName);
   }
 
-  private formatSummaryResponse(analysis: DocumentAnalysis, documentName: string): string {
+  private formatSummaryResponse(analysis: DocumentAnalysis, _documentName: string): string {
     const opener = getRandomPhrase(CONTEXT_PHRASES.summary);
-    const cleanedSummary = shortenSentence(analysis.summary, 50);
+    
+    const bullets = analysis.topSentences.length > 0 
+      ? toBulletPoints(analysis.topSentences.slice(0, 4), 4)
+      : '• The document contains highly sparse text or images that could not be fully summarized.\n• Please try asking specific questions.';
 
-    const topKeywords = analysis.keywords.slice(0, 5).join(', ');
-
-    return `**Summary**
-
-${opener} this document focuses on the following:
-
-${toBulletPoints(analysis.topSentences.slice(0, 3), 3)}
-
-**Key Topics:** ${topKeywords}
-
-**Quick Stats:**
-• ${analysis.stats.wordCount.toLocaleString()} words
-• ~${analysis.stats.estimatedReadTime} min read`;
+    return `**Summary**\n\n${opener}\n\n${bullets}`;
   }
 
-  private formatKeyPointsResponse(analysis: DocumentAnalysis, documentName: string): string {
+  private formatKeyPointsResponse(analysis: DocumentAnalysis, _documentName: string): string {
     const opener = getRandomPhrase(CONTEXT_PHRASES.keyPoints);
     const uniquePoints = removeDuplicates(analysis.keyPoints);
 
-    const formattedPoints = uniquePoints
-      .slice(0, 4)
-      .map((p, i) => `${i + 1}. **${this.extractCoreIdea(p)}** — ${shortenSentence(p, 20)}`)
-      .join('\n');
+    const bullets = uniquePoints.length > 0
+      ? toBulletPoints(uniquePoints.slice(0, 4), 4)
+      : analysis.topSentences.length > 0
+        ? toBulletPoints(analysis.topSentences.slice(0, 4), 4)
+        : '• No explicit key points could be extracted from this sparse document.';
 
-    return `**Key Points**
-
-${opener}
-
-${formattedPoints}
-
-*Core themes: ${analysis.keywords.slice(0, 4).join(', ')}*`;
+    return `**Key Points**\n\n${opener}\n\n${bullets}`;
   }
 
   private formatMethodologyResponse(analysis: DocumentAnalysis, documentName: string): string {
@@ -518,13 +497,7 @@ ${formattedPoints}
         .filter(s => s.trim().length > 20)
         .slice(0, 4);
 
-      return `**Methodology**
-
-${opener}
-
-${toBulletPoints(methodPoints, 4)}
-
-*This approach is central to the document's findings.*`;
+      return `**Methodology**\n\n${opener}\n\n${toBulletPoints(methodPoints, 4)}`;
     }
 
     // Fallback to relevant sentences
@@ -533,19 +506,13 @@ ${toBulletPoints(methodPoints, 4)}
       .slice(0, 3);
 
     if (methodSentences.length > 0) {
-      return `**Approach**
-
-${opener}
-
-${toBulletPoints(methodSentences, 3)}
-
-*These are the key methodological aspects identified.*`;
+      return `**Methodology**\n\n${opener}\n\n${toBulletPoints(methodSentences, 3)}`;
     }
 
     return this.formatDefaultResponse(analysis, 'methodology', documentName);
   }
 
-  private formatResultsResponse(analysis: DocumentAnalysis, documentName: string): string {
+  private formatResultsResponse(analysis: DocumentAnalysis, _documentName: string): string {
     const opener = getRandomPhrase(CONTEXT_PHRASES.results);
     const resultSection = analysis.sections.find(s => s.type === 'results');
     const conclusionSection = analysis.sections.find(s => s.type === 'conclusion');
@@ -558,13 +525,7 @@ ${toBulletPoints(methodSentences, 3)}
         .filter(s => s.trim().length > 20)
         .slice(0, 4);
 
-      return `**Key Findings**
-
-${opener}
-
-${toBulletPoints(resultPoints, 4)}
-
-*These conclusions are supported by evidence in the document.*`;
+      return `**Key Findings**\n\n${opener}\n\n${toBulletPoints(resultPoints, 4)}`;
     }
 
     // Fallback to signal-word sentences
@@ -572,13 +533,7 @@ ${toBulletPoints(resultPoints, 4)}
       .filter(s => /result|finding|show|demonstrate|conclude|indicate|achieve/i.test(s))
       .slice(0, 3);
 
-    return `**Findings**
-
-${opener}
-
-${toBulletPoints(resultSentences, 3)}
-
-*Based on the key evidence presented.*`;
+    return `**Key Findings**\n\n${opener}\n\n${toBulletPoints(resultSentences, 3)}`;
   }
 
   private formatExplainResponse(analysis: DocumentAnalysis, query: string, documentName: string): string {
@@ -600,31 +555,21 @@ ${toBulletPoints(resultSentences, 3)}
       .map(s => s.sentence);
 
     if (relevantSentences.length > 0) {
-      return `**Explanation**
-
-${opener}
-
-${toBulletPoints(relevantSentences, 3)}
-
-*This addresses the concepts mentioned in your question.*`;
+      return `**Explanation**\n\n${opener}\n\n${toBulletPoints(relevantSentences, 3)}`;
     }
 
     return this.formatDefaultResponse(analysis, query, documentName);
   }
 
-  private formatDefaultResponse(analysis: DocumentAnalysis, query: string, documentName: string): string {
+  private formatDefaultResponse(analysis: DocumentAnalysis, _query: string, _documentName: string): string {
     const opener = getRandomPhrase(CONTEXT_PHRASES.default);
     const uniqueSentences = removeDuplicates(analysis.topSentences);
 
-    return `**From Your Document**
+    const bullets = uniqueSentences.length > 0
+      ? toBulletPoints(uniqueSentences.slice(0, 3), 3)
+      : '• This document appears to be very sparse or mostly visual.\n• Broad summaries are difficult to generate.';
 
-${opener}
-
-${toBulletPoints(uniqueSentences.slice(0, 3), 3)}
-
-**Related topics:** ${analysis.keywords.slice(0, 5).join(', ')}
-
-*Try asking about "summary", "key points", or "methodology" for more specific insights.*`;
+    return `**Key Insights**\n\n${opener}\n\n${bullets}`;
   }
 
   /**
