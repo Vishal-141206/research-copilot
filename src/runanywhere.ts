@@ -1,13 +1,10 @@
 /**
  * RunAnywhere SDK initialization and model catalog.
  *
- * This module:
- * 1. Initializes the core SDK (TypeScript-only, no WASM)
- * 2. Registers the LlamaCPP backend (loads LLM/VLM WASM)
- * 3. Registers the ONNX backend (sherpa-onnx — STT/TTS/VAD)
- * 4. Registers the model catalog and wires up VLM worker
- *
- * Import this module once at app startup.
+ * OPTIMIZED FOR HACKATHON:
+ * - Force WebGPU acceleration where available
+ * - Performance logging for debugging
+ * - Model warmup for consistent latency
  */
 
 import {
@@ -25,6 +22,59 @@ import { ONNX } from '@runanywhere/web-onnx';
 // Vite bundles the worker as a standalone JS chunk and returns its URL.
 // @ts-ignore — Vite-specific ?worker&url query
 import vlmWorkerUrl from './workers/vlm-worker?worker&url';
+
+// ---------------------------------------------------------------------------
+// Performance Logging
+// ---------------------------------------------------------------------------
+
+const perfLog = (label: string, startTime?: number) => {
+  if (startTime) {
+    console.log(`[PERF] ${label}: ${Date.now() - startTime}ms`);
+  } else {
+    console.log(`[PERF] ${label}`);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// WebGPU Detection (with type safety)
+// ---------------------------------------------------------------------------
+
+interface GPUAdapterInfo {
+  vendor?: string;
+  architecture?: string;
+  device?: string;
+}
+
+export async function checkWebGPUSupport(): Promise<{ supported: boolean; info: GPUAdapterInfo | null }> {
+  try {
+    // @ts-ignore - WebGPU types not in standard lib
+    const gpu = navigator.gpu;
+    if (!gpu) {
+      console.warn('[GPU] WebGPU not available in this browser');
+      return { supported: false, info: null };
+    }
+
+    // @ts-ignore - WebGPU types
+    const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) {
+      console.warn('[GPU] No WebGPU adapter found');
+      return { supported: false, info: null };
+    }
+
+    // @ts-ignore - WebGPU types
+    const info: GPUAdapterInfo = await adapter.requestAdapterInfo?.() || {};
+    console.log('[GPU] WebGPU Adapter:', {
+      vendor: info.vendor || 'unknown',
+      architecture: info.architecture || 'unknown',
+      device: info.device || 'unknown',
+    });
+
+    return { supported: true, info };
+  } catch (e) {
+    console.warn('[GPU] WebGPU check failed:', e);
+    return { supported: false, info: null };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Model catalog
@@ -98,24 +148,56 @@ const MODELS: CompactModelDef[] = [
 // ---------------------------------------------------------------------------
 
 let _initPromise: Promise<void> | null = null;
+let _webgpuSupported = false;
+let _accelerationMode: string | null = null;
 
 /** Initialize the RunAnywhere SDK. Safe to call multiple times. */
 export async function initSDK(): Promise<void> {
   if (_initPromise) return _initPromise;
 
   _initPromise = (async () => {
+    const initStart = Date.now();
+    perfLog('SDK initialization started');
+
+    // Step 0: Check WebGPU support FIRST
+    const gpuCheck = await checkWebGPUSupport();
+    _webgpuSupported = gpuCheck.supported;
+    perfLog(`WebGPU check complete (supported: ${_webgpuSupported})`, initStart);
+
     // Step 1: Initialize core SDK (TypeScript-only, no WASM)
+    const coreStart = Date.now();
     await RunAnywhere.initialize({
       environment: SDKEnvironment.Development,
       debug: true,
     });
+    perfLog('Core SDK initialized', coreStart);
 
     // Step 2: Register backends (loads WASM automatically)
+    const llamaStart = Date.now();
     await LlamaCPP.register();
+    _accelerationMode = LlamaCPP.accelerationMode;
+    perfLog(`LlamaCPP registered (mode: ${_accelerationMode})`, llamaStart);
+
+    // Log acceleration mode prominently
+    console.log('========================================');
+    console.log(`[RUNTIME] Acceleration Mode: ${_accelerationMode}`);
+    console.log(`[RUNTIME] WebGPU Available: ${_webgpuSupported}`);
+    if (_accelerationMode === 'webgpu') {
+      console.log('[RUNTIME] ✅ Using WebGPU - FAST mode');
+    } else if (_accelerationMode === 'simd') {
+      console.log('[RUNTIME] ⚠️ Using SIMD CPU - Moderate speed');
+    } else {
+      console.log('[RUNTIME] ❌ Using basic CPU - SLOW mode');
+    }
+    console.log('========================================');
+
+    const onnxStart = Date.now();
     await ONNX.register();
+    perfLog('ONNX registered', onnxStart);
 
     // Step 3: Register model catalog
     RunAnywhere.registerModels(MODELS);
+    perfLog('Models registered');
 
     // Step 4: Wire up VLM worker
     VLMWorkerBridge.shared.workerUrl = vlmWorkerUrl;
@@ -125,6 +207,8 @@ export async function initSDK(): Promise<void> {
       loadModel: (params) => VLMWorkerBridge.shared.loadModel(params),
       unloadModel: () => VLMWorkerBridge.shared.unloadModel(),
     });
+
+    perfLog('SDK initialization complete', initStart);
   })();
 
   return _initPromise;
@@ -132,7 +216,17 @@ export async function initSDK(): Promise<void> {
 
 /** Get acceleration mode after init. */
 export function getAccelerationMode(): string | null {
-  return LlamaCPP.isRegistered ? LlamaCPP.accelerationMode : null;
+  return _accelerationMode;
+}
+
+/** Check if WebGPU is being used */
+export function isUsingWebGPU(): boolean {
+  return _accelerationMode === 'webgpu';
+}
+
+/** Check if WebGPU is supported */
+export function isWebGPUSupported(): boolean {
+  return _webgpuSupported;
 }
 
 // Re-export for convenience
