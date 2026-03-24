@@ -58,15 +58,40 @@ function copyWasmPlugin(): Plugin {
     },
   };
 }
+/**
+ * Strips sourceMappingURL comments from @runanywhere packages.
+ * These packages ship broken sourcemaps (pointing to missing source files).
+ * Uses the `load` hook (not `transform`) because Vite resolves sourcemaps
+ * from disk before the transform stage runs for excluded packages.
+ */
+function suppressRunanywhereSourcemaps(): Plugin {
+  return {
+    name: 'suppress-runanywhere-sourcemaps',
+    enforce: 'pre',
+    load(id) {
+      if (id.includes('@runanywhere') && id.endsWith('.js')) {
+        const code = fs.readFileSync(id, 'utf-8');
+        return {
+          code: code.replace(/\/\/# sourceMappingURL=.*$/gm, ''),
+          map: null,
+        };
+      }
+    },
+  };
+}
 
 export default defineConfig({
-  plugins: [react(), copyWasmPlugin()],
+  plugins: [react(), suppressRunanywhereSourcemaps(), copyWasmPlugin()],
   server: {
     headers: {
       // Cross-Origin Isolation — required for SharedArrayBuffer / multi-threaded WASM.
       // Without these headers the SDK falls back to single-threaded mode.
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'credentialless',
+    },
+    // Pre-warm frequently used files for faster page loads
+    warmup: {
+      clientFiles: ['./src/main.tsx', './src/App.tsx', './src/runanywhere.ts'],
     },
   },
   assetsInclude: ['**/*.wasm'],
@@ -76,9 +101,15 @@ export default defineConfig({
     // import.meta.url resolves correctly to node_modules paths
     // (needed for automatic WASM file discovery at ../../wasm/).
     exclude: ['@runanywhere/web-llamacpp', '@runanywhere/web-onnx'],
+    // Pre-bundle these for faster cold starts
+    include: ['react', 'react-dom', 'framer-motion'],
   },
   build: {
     sourcemap: false,
+    // Enable CSS code splitting for faster initial loads
+    cssCodeSplit: true,
+    // Increase chunk size warning limit (WASM files are large)
+    chunkSizeWarningLimit: 2000,
     rollupOptions: {
       onwarn(warning, warn) {
         if (warning.code === 'SOURCEMAP_ERROR') return;
@@ -88,12 +119,16 @@ export default defineConfig({
         manualChunks: {
           'vendor-react': ['react', 'react-dom'],
           'vendor-pdf': ['pdfjs-dist'],
+          'vendor-motion': ['framer-motion'],
         },
         sourcemapExcludeSources: true,
       },
     },
   },
-  // Suppress sourcemap warnings in dev mode
-  logLevel: 'warn',
+  // Suppress sourcemap warnings from third-party @runanywhere packages
+  css: {
+    devSourcemap: false,
+  },
+  logLevel: 'info',
   clearScreen: false,
 });

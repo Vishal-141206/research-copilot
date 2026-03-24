@@ -356,7 +356,7 @@ export async function injectDemoCache(): Promise<void> {
     const resp = getDemoResponse(q);
     if (resp) {
       for (const mode of modes) {
-        await QueryCache.set(q, resp, [], mode);
+        await QueryCache.save(q, resp, [], mode);
         cached++;
       }
     }

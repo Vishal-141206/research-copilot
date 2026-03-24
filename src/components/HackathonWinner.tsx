@@ -438,15 +438,8 @@ export function HackathonWinner() {
 
       addMessage('assistant', `I've analyzed **"${file.name}"** (${pdf.numPages} pages, ~${wordCount.toLocaleString()} words).\n\nAsk me anything about this document! Semantic search is being prepared in the background.`);
 
-      // Process RAG embeddings in BACKGROUND — don't block the user
-      DocumentStore.processDocumentForRAG(doc.id, (status, prog) => {
-        setStatusMessage(status);
-        setProgress(0.8 + prog * 0.2);
-        if (prog >= 1) {
-          setDocStats(prev => prev ? { ...prev, chunks: doc.chunks?.length || prev.chunks } : null);
-          setStatusMessage('');
-        }
-      }).catch(err => console.warn('Background RAG processing:', err));
+      // addDocument already performs extraction/chunking; keep UI responsive.
+      setStatusMessage('');
 
     } catch (error) {
       console.error('PDF processing error:', error);
@@ -718,20 +711,16 @@ REFERENCES
         const searchStart = Date.now();
 
         try {
-          if (DocumentStore.isDocumentReady(currentDocument.id)) {
-            // Use semantic search if embeddings are ready, but time-limit it strictly
-            const vectorPromise = DocumentStore.searchDocument(currentDocument.id, query, 1);
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject('timeout'), 300));
+          // Use semantic search if embeddings are available, but time-limit it strictly.
+          const vectorPromise = DocumentStore.searchDocument(currentDocument.id, query, 1);
+          const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject('timeout'), 300));
 
-            const searchResults = await Promise.race([vectorPromise, timeoutPromise]) as any[];
-            context = searchResults.length > 0
-              ? searchResults[0].chunk.slice(0, 300)
-              : currentDocument.text.slice(0, 300);
+          const searchResults = await Promise.race([vectorPromise, timeoutPromise]) as any[];
+          context = searchResults.length > 0
+            ? searchResults[0].chunk.slice(0, 300)
+            : currentDocument.text.slice(0, 300);
 
-            console.log(`[RAG] Vector search finished in ${Date.now() - searchStart}ms`);
-          } else {
-            throw new Error('Embeddings not ready');
-          }
+          console.log(`[RAG] Vector search finished in ${Date.now() - searchStart}ms`);
         } catch (e) {
           // Fallback to keyword search (near-instant) if vector search is too slow or failed
           const kwStart = Date.now();
@@ -783,7 +772,7 @@ REFERENCES
       }
       
       if (demoMode) {
-        await QueryCache.set(query, response, [], explainMode);
+        await QueryCache.save(query, response, [], explainMode);
       }
 
       } catch (error) {

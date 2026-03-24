@@ -19,9 +19,7 @@ import {
 import { LlamaCPP, VLMWorkerBridge } from '@runanywhere/web-llamacpp';
 import { ONNX } from '@runanywhere/web-onnx';
 
-// Vite bundles the worker as a standalone JS chunk and returns its URL.
-// @ts-ignore — Vite-specific ?worker&url query
-import vlmWorkerUrl from './workers/vlm-worker?worker&url';
+// VLM worker removed in current codebase.
 
 // ---------------------------------------------------------------------------
 // Performance Logging
@@ -199,14 +197,7 @@ export async function initSDK(): Promise<void> {
     RunAnywhere.registerModels(MODELS);
     perfLog('Models registered');
 
-    // Step 4: Wire up VLM worker
-    VLMWorkerBridge.shared.workerUrl = vlmWorkerUrl;
-    RunAnywhere.setVLMLoader({
-      get isInitialized() { return VLMWorkerBridge.shared.isInitialized; },
-      init: () => VLMWorkerBridge.shared.init(),
-      loadModel: (params) => VLMWorkerBridge.shared.loadModel(params),
-      unloadModel: () => VLMWorkerBridge.shared.unloadModel(),
-    });
+    // Step 4: VLM worker setup intentionally disabled.
 
     perfLog('SDK initialization complete', initStart);
   })();

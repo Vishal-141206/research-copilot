@@ -1,9 +1,10 @@
 /**
  * Smart Query Cache System
  * Stores queries and responses for instant replay during demos
+ * Optimized to use native localStorage for zero-latency lookups.
  */
 
-import localforage from 'localforage';
+const STORAGE_KEY = 'research-copilot-query-cache-lite';
 
 interface CachedQuery {
   query: string;
@@ -15,22 +16,29 @@ interface CachedQuery {
 
 class QueryCacheClass {
   private cache: Map<string, CachedQuery> = new Map();
-  private storage = localforage.createInstance({
-    name: 'research-copilot',
-    storeName: 'query-cache',
-  });
 
-  async init() {
+  constructor() {
+    this.init();
+  }
+
+  init() {
     try {
-      const keys = await this.storage.keys();
-      for (const key of keys) {
-        const value = await this.storage.getItem<CachedQuery>(key);
-        if (value) {
-          this.cache.set(key, value);
-        }
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const docs = JSON.parse(stored) as Array<[string, CachedQuery]>;
+        docs.forEach(([key, value]) => this.cache.set(key, value));
       }
     } catch (err) {
       console.warn('Failed to load cache:', err);
+    }
+  }
+
+  private saveToStorage() {
+    try {
+      const entries = Array.from(this.cache.entries());
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+    } catch (err) {
+      console.warn('Failed to save cache:', err);
     }
   }
 
@@ -43,7 +51,7 @@ class QueryCacheClass {
     return this.cache.get(key) || null;
   }
 
-  async set(query: string, response: string, context?: string[], mode?: string, documentId?: string) {
+  async save(query: string, response: string, context?: string[], mode?: string, documentId?: string) {
     const key = this.normalizeQuery(query) + (mode ? `-${mode}` : '') + (documentId ? `-${documentId}` : '');
     const cached: CachedQuery = {
       query,
@@ -54,17 +62,12 @@ class QueryCacheClass {
     };
     
     this.cache.set(key, cached);
-    
-    try {
-      await this.storage.setItem(key, cached);
-    } catch (err) {
-      console.warn('Failed to persist cache:', err);
-    }
+    this.saveToStorage();
   }
 
   clear() {
     this.cache.clear();
-    this.storage.clear();
+    localStorage.removeItem(STORAGE_KEY);
   }
 }
 
