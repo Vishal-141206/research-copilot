@@ -137,3 +137,175 @@ body {
 .status-transition {
   animation: status-slide 0.2s ease-out;
 }
+
+/* ==== PERCEPTION-FIRST: Visual Speed Engineering ==== */
+
+/* Instant typing cursor */
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: #6366f1;
+  margin-left: 2px;
+  animation: cursor-blink 0.8s infinite;
+}
+
+/* Enhanced skeleton with shimmer effect */
+@keyframes skeleton-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton-loader-enhanced {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+}
+.skeleton-line-shimmer {
+  height: 14px;
+  border-radius: 7px;
+  background: linear-gradient(
+    90deg,
+    rgba(99,102,241,0.08) 0%,
+    rgba(168,85,247,0.25) 25%,
+    rgba(99,102,241,0.08) 50%,
+    rgba(168,85,247,0.25) 75%,
+    rgba(99,102,241,0.08) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.5s infinite linear;
+}
+.skeleton-line-shimmer:nth-child(1) { width: 95%; }
+.skeleton-line-shimmer:nth-child(2) { width: 82%; animation-delay: 0.1s; }
+.skeleton-line-shimmer:nth-child(3) { width: 70%; animation-delay: 0.2s; }
+.skeleton-line-shimmer:nth-child(4) { width: 88%; animation-delay: 0.3s; }
+
+/* Instant response badge */
+@keyframes badge-pop {
+  0% { transform: scale(0); opacity: 0; }
+  60% { transform: scale(1.1); }
+  100% { transform: scale(1); opacity: 1; }
+}
+.instant-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: linear-gradient(135deg, rgba(34,197,94,0.2), rgba(34,197,94,0.1));
+  border: 1px solid rgba(34,197,94,0.3);
+  border-radius: 12px;
+  font-size: 0.7em;
+  color: #4ade80;
+  animation: badge-pop 0.3s ease-out;
+}
+.instant-badge::before {
+  content: '⚡';
+}
+
+/* AI-enhanced response indicator */
+.ai-enhanced-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: linear-gradient(135deg, rgba(168,85,247,0.2), rgba(168,85,247,0.1));
+  border: 1px solid rgba(168,85,247,0.3);
+  border-radius: 12px;
+  font-size: 0.7em;
+  color: #c084fc;
+  animation: badge-pop 0.3s ease-out;
+}
+.ai-enhanced-badge::before {
+  content: '✨';
+}
+
+/* Smooth response transition */
+@keyframes response-appear {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.response-animated {
+  animation: response-appear 0.25s ease-out;
+}
+
+/* Processing dots animation */
+@keyframes dot-pulse {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
+}
+.processing-dots {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 6px;
+}
+.processing-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #6366f1;
+  animation: dot-pulse 1.2s infinite ease-in-out;
+}
+.processing-dots span:nth-child(1) { animation-delay: 0s; }
+.processing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.processing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+/* Perception mode indicator */
+.perception-indicator {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  padding: 8px 14px;
+  background: rgba(34,197,94,0.15);
+  border: 1px solid rgba(34,197,94,0.3);
+  border-radius: 20px;
+  font-size: 0.75em;
+  color: #4ade80;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  z-index: 1000;
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 0.3s, transform 0.3s;
+}
+.perception-indicator.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.perception-indicator::before {
+  content: '⚡';
+  font-size: 1.1em;
+}
+
+/* Confidence meter */
+.confidence-meter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.7em;
+  color: #888;
+  margin-top: 6px;
+}
+.confidence-meter-bar {
+  width: 50px;
+  height: 4px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.confidence-meter-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #6366f1, #a855f7);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}

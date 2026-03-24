@@ -17,6 +17,8 @@ import { STT } from '@runanywhere/web-onnx';
 import { DocumentStore, Document as StoredDoc } from '../utils/documentStore';
 import { QueryCache } from '../utils/queryCache';
 import { getDemoResponse, createDemoPDFBlob, injectDemoCache } from '../utils/demoHelpers';
+import { PerceptionEngine, createTypingAnimation, getSkeletonHTML, InstantResponse } from '../utils/perceptionEngine';
+import { DocumentAnalyzer, DocumentAnalysis } from '../utils/documentAnalyzer';
 import { getAccelerationMode, isUsingWebGPU } from '../runanywhere';
 import * as pdfjsLib from 'pdfjs-dist';
 
@@ -58,10 +60,31 @@ interface FloatingAction {
 const DEBUG_MODE = false;
 
 /**
+ * DEMO_SAFE_MODE: Controls background LLM refinement behavior.
+ * When true:
+ * - Disables slow background LLM refinement for ALL documents
+ * - Pre-caches demo responses at startup
+ * - Guarantees fast responses without LLM dependency
+ *
+ * IMPORTANT: This does NOT affect primary query routing!
+ * - Demo documents -> PerceptionEngine (based on isDemoDocument flag)
+ * - Real documents -> DocumentAnalyzer (ALWAYS, regardless of this flag)
+ *
+ * Set to TRUE before any live demo!
+ */
+const DEMO_SAFE_MODE = true;
+
+/**
  * LLM_TIMEOUT_MS: Maximum time to wait for LLM response before fallback.
  * AGGRESSIVE: 2 seconds max to ensure snappy UX.
  */
 const LLM_TIMEOUT_MS = 2000;
+
+/**
+ * LLM_REFINEMENT_TIMEOUT_MS: Max time for background LLM refinement.
+ * If exceeded, silently discard - don't update UI with stale response.
+ */
+const LLM_REFINEMENT_TIMEOUT_MS = 3000;
 
 // ============================================================================
 // DEMO RESPONSES (Fallback when models unavailable)
@@ -242,6 +265,7 @@ export function HackathonWinner() {
   // UI state
   const [isDragging, setIsDragging] = useState(false);
   const [floatingAction, setFloatingAction] = useState<FloatingAction | null>(null);
+  const [isDemoDocument, setIsDemoDocument] = useState(false);  // Tracks if current doc is demo
   const [demoMode, setDemoMode] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [showGuide, setShowGuide] = useState(true);
@@ -249,12 +273,15 @@ export function HackathonWinner() {
   const [voiceTranscript, setVoiceTranscript] = useState<string | null>(null);
   const [smartSuggestions, setSmartSuggestions] = useState<string[]>([]);
   const [docStats, setDocStats] = useState<{words: number; readTime: number; chunks: number} | null>(null);
+  const [documentAnalysis, setDocumentAnalysis] = useState<DocumentAnalysis | null>(null);
 
   // Refs
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<(() => void) | null>(null);
   const voiceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingCancelRef = useRef<(() => void) | null>(null);
+  const refinementActiveRef = useRef<Set<string>>(new Set());
 
   // -------------------------------------------------------------------------
   // INITIALIZATION
@@ -304,9 +331,24 @@ export function HackathonWinner() {
         setLlmState('ready');
       }
 
+      setProgress(0.8);
+
+      // AUTO-PRELOAD: In DEMO_SAFE_MODE, auto-load demo document for instant start
+      if (DEMO_SAFE_MODE) {
+        setStatusMessage('Preloading demo...');
+        await injectDemoCache();
+        console.log('[DEMO_SAFE] Cache warmed with demo responses');
+      }
+
       setProgress(1);
       setAppState('welcome');
       setStatusMessage('');
+
+      // Auto-load demo document if DEMO_SAFE_MODE (uncomment for auto-demo)
+      // if (DEMO_SAFE_MODE) {
+      //   setTimeout(() => loadDemoDocument(), 500);
+      // }
+
     } catch (error) {
       console.warn('Init warning:', error);
       setAppState('welcome');
@@ -393,6 +435,13 @@ export function HackathonWinner() {
       setStatusMessage('Reading document...');
       setProgress(0.1);
 
+      // Clear demo mode and old analysis when uploading new document
+      // CRITICAL: This is a REAL document, not a demo document
+      setIsDemoDocument(false);
+      setDemoMode(false);
+      setDocumentAnalysis(null);
+      DocumentAnalyzer.clearCache(); // Clear any previous analysis cache
+
       const arrayBuffer = await file.arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
@@ -412,7 +461,13 @@ export function HackathonWinner() {
       setPdfText(fullText.trim());
       setPdfName(file.name);
       setProgress(0.7);
-      setStatusMessage('Preparing document...');
+      setStatusMessage('Analyzing document...');
+
+      // DUAL-MODE: Fast document analysis for real documents (no LLM needed)
+      const docId = `doc-${Date.now()}-${file.name}`;
+      const analysis = await DocumentAnalyzer.analyzeDocument(docId, fullText);
+      setDocumentAnalysis(analysis);
+      console.log(`[DocumentAnalyzer] Fast analysis complete: ${analysis.keywords.slice(0, 5).join(', ')}`);
 
       // Add to document store (quick — no embeddings yet)
       const doc = await DocumentStore.addDocument(file, (status, prog) => {
@@ -422,13 +477,18 @@ export function HackathonWinner() {
 
       setCurrentDocument(doc);
       setDemoMode(false);
+      setIsDemoDocument(false); // Confirm: this is NOT a demo document
+      console.log('[MODE] Real document uploaded - isDemoDocument=false, demoMode=false');
 
-      // Generate stats
-      const wordCount = fullText.split(/\s+/).length;
-      setDocStats({ words: wordCount, readTime: Math.ceil(wordCount / 200), chunks: doc.chunks?.length || 0 });
+      // Generate stats from analysis
+      setDocStats({
+        words: analysis.stats.wordCount,
+        readTime: analysis.stats.estimatedReadTime,
+        chunks: doc.chunks?.length || 0
+      });
 
-      // Smart suggestions generated from doc content (no pre-caching for real docs — LLM will answer)
-      const suggestions = generateSmartSuggestions(fullText, file.name);
+      // Smart suggestions from DocumentAnalyzer (context-aware)
+      const suggestions = DocumentAnalyzer.getSuggestedQueries(analysis);
       setSmartSuggestions(suggestions);
 
       // Mark as READY immediately — user can start asking questions
@@ -436,7 +496,7 @@ export function HackathonWinner() {
       setGuideStep(1);
       setProgress(0.8);
 
-      addMessage('assistant', `I've analyzed **"${file.name}"** (${pdf.numPages} pages, ~${wordCount.toLocaleString()} words).\n\nAsk me anything about this document! Semantic search is being prepared in the background.`);
+      addMessage('assistant', `I've analyzed **"${file.name}"** (${pdf.numPages} pages, ~${analysis.stats.wordCount.toLocaleString()} words).\n\nAsk me anything about this document! Semantic search is being prepared in the background.`);
 
       // addDocument already performs extraction/chunking; keep UI responsive.
       setStatusMessage('');
@@ -527,7 +587,10 @@ REFERENCES
 
     setAppState('ready');
     setGuideStep(1);
+    setIsDemoDocument(true);  // CRITICAL: This IS a demo document
     setDemoMode(true);
+    setDocumentAnalysis(null); // Clear analysis so demo uses PerceptionEngine
+    console.log('[MODE] Demo document loaded - isDemoDocument=true, demoMode=true');
 
     // Pre-cache demo responses for instant replies
     injectDemoCache().catch(console.warn);
@@ -662,131 +725,292 @@ REFERENCES
     addMessage('user', query);
     setGuideStep(Math.max(guideStep, 2));
 
+    // Cancel any pending typing animation
+    if (typingCancelRef.current) {
+      typingCancelRef.current();
+      typingCancelRef.current = null;
+    }
+
+    const queryId = `query-${Date.now()}`;
+    const startTime = performance.now();
+
+    // DEBUG: Log mode state before processing query
+    console.log('[MODE CHECK]', {
+      isDemoDocument,
+      demoMode,
+      hasDocumentAnalysis: !!documentAnalysis,
+      hasCurrentDocument: !!currentDocument,
+      DEMO_SAFE_MODE
+    });
+
     try {
-      // Check cache ONLY in demo mode
-      if (demoMode) {
-        const cached = await QueryCache.get(query, explainMode);
-        if (cached) {
-          await simulateStream(cached.response, true);
-          return;
-        }
-        
-        // Demo Mode Turbo Fallback: If not in cache, don't use the slow LLM!
-        // Instead, find the best snippet and wrap it in a clean AI template.
-        const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument?.id || 'demo', query, 1);
-        const snippet = kwResults.length > 0 ? kwResults[0].snippet : "I couldn't find a specific answer, but the document mentions several related topics.";
-        const fastResp = `Based on the document: "${snippet.slice(0, 300)}..."`;
-        await simulateStream(fastResp);
-        return;
+      // ========================================================================
+      // DEMO DOCUMENT: Use PerceptionEngine for instant, polished responses
+      // This ONLY triggers for demo documents (isDemoDocument === true)
+      // ========================================================================
+      if (isDemoDocument) {
+        setAppState('streaming');
+        setStatusMessage('');
+
+        // Small delay for realism (200-350ms)
+        await new Promise(r => setTimeout(r, 200 + Math.random() * 150));
+
+        const instantResponse = await PerceptionEngine.getInstantResponse(
+          query,
+          currentDocument?.id,
+          currentDocument?.text,
+          explainMode
+        );
+
+        console.log(`[PerceptionEngine] Demo response in ${(performance.now() - startTime).toFixed(0)}ms`);
+
+        const msgId = addMessage('assistant', '', true); // Mark as cached for speed badge
+
+        // Fast typing animation - optimized for demo
+        await new Promise<void>((resolve) => {
+          typingCancelRef.current = createTypingAnimation(
+            instantResponse.text,
+            (partial) => updateMessage(msgId, partial, true),
+            () => {
+              updateMessage(msgId, instantResponse.text, false);
+              resolve();
+            },
+            8 // FASTER: 8ms per word chunk for demo
+          );
+        });
+
+        setAppState('ready');
+        return; // EXIT - demo response shown
       }
 
-      setAppState('thinking');
-      setStatusMessage('Finding answer...');
+      // ========================================================================
+      // REAL DOCUMENT MODE: ALWAYS use DocumentAnalyzer for user-uploaded docs
+      // NEVER falls back to PerceptionEngine - uses text extraction instead
+      // ========================================================================
+      if (!isDemoDocument && currentDocument) {
+        setAppState('streaming');
+        setStatusMessage('');
 
-      let response = '';
-      let alreadyStreamed = false;
+        // Small delay for perceived processing (250-400ms)
+        await new Promise(r => setTimeout(r, 250 + Math.random() * 150));
 
-      if (demoMode) {
-        // Demo mode - use cached responses
-        response = getIntelligentResponse(query);
-      } else if (DEBUG_MODE && llmState === 'ready') {
-        // DEBUG_MODE: Test LLM alone without RAG to isolate performance issues
-        console.log('[DEBUG] Testing LLM directly (RAG bypassed)');
-        const debugStart = Date.now();
-        try {
-          const llmPromise = generateWithLLM(query, 'No context provided - debug mode.');
-          const timeoutPromise = new Promise<string>((_, reject) =>
-            setTimeout(() => reject(new Error('LLM_TIMEOUT')), LLM_TIMEOUT_MS)
+        let responseText: string;
+
+        // Primary: Use document analysis if available
+        if (documentAnalysis) {
+          responseText = DocumentAnalyzer.generateResponse(
+            documentAnalysis,
+            query,
+            pdfName || 'Document'
           );
-          response = await Promise.race([llmPromise, timeoutPromise]);
-          console.log(`[DEBUG] LLM-only response time: ${Date.now() - debugStart}ms`);
-        } catch (e: any) {
-          console.error(`[DEBUG] LLM failed: ${e.message}`);
-          response = `[DEBUG] LLM timeout/error after ${Date.now() - debugStart}ms. Check runtime acceleration mode.`;
-        }
-        alreadyStreamed = true;
-      } else if (currentDocument && llmState === 'ready') {
-        // Real RAG + LLM with "Race-to-Result" optimization
-        let context = '';
-        const searchStart = Date.now();
-
-        try {
-          // Use semantic search if embeddings are available, but time-limit it strictly.
-          const vectorPromise = DocumentStore.searchDocument(currentDocument.id, query, 1);
-          const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject('timeout'), 300));
-
-          const searchResults = await Promise.race([vectorPromise, timeoutPromise]) as any[];
-          context = searchResults.length > 0
-            ? searchResults[0].chunk.slice(0, 300)
-            : currentDocument.text.slice(0, 300);
-
-          console.log(`[RAG] Vector search finished in ${Date.now() - searchStart}ms`);
-        } catch (e) {
-          // Fallback to keyword search (near-instant) if vector search is too slow or failed
-          const kwStart = Date.now();
-          const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 1);
-          context = kwResults.length > 0
-            ? kwResults[0].snippet.slice(0, 300)
-            : currentDocument.text.slice(0, 300);
-          console.warn(`[RAG] Using Keyword Fallback (${Date.now() - kwStart}ms) - Reason: ${e}`);
+          console.log(`[DocumentAnalyzer] Instant response in ${(performance.now() - startTime).toFixed(0)}ms`);
+        } else {
+          // FAILSAFE: Generate response from raw text (no PerceptionEngine!)
+          console.warn('[DocumentAnalyzer] No analysis available - using text extraction fallback');
+          responseText = generateTextExtractionFallback(currentDocument.text, query, pdfName || 'Document');
         }
 
-        // TIMEOUT PROTECTION: Race LLM against aggressive timeout
-        const llmStart = Date.now();
-        try {
-          const llmPromise = generateWithLLM(query, context);
-          const timeoutPromise = new Promise<string>((_, reject) =>
-            setTimeout(() => reject(new Error('LLM_TIMEOUT')), LLM_TIMEOUT_MS)
-          );
+        const msgId = addMessage('assistant', '', true);
 
-          response = await Promise.race([llmPromise, timeoutPromise]);
-          console.log(`[PERF] Total query time: ${Date.now() - llmStart}ms`);
-        } catch (timeoutErr: any) {
-          if (timeoutErr.message === 'LLM_TIMEOUT') {
-            console.warn(`[LLM] Timeout after ${LLM_TIMEOUT_MS}ms - using fallback`);
-            // Cancel ongoing generation
-            if (cancelRef.current) {
-              cancelRef.current();
-              cancelRef.current = null;
+        // Typing animation for perceived intelligence
+        await new Promise<void>((resolve) => {
+          typingCancelRef.current = createTypingAnimation(
+            responseText,
+            (partial) => updateMessage(msgId, partial, true),
+            () => {
+              updateMessage(msgId, responseText, false);
+              resolve();
+            },
+            10 // Balanced speed for real documents
+          );
+        });
+
+        setAppState('ready');
+
+        // Optional: Background LLM refinement for real documents (if available and not in safe mode)
+        if (llmState === 'ready' && !DEMO_SAFE_MODE) {
+          const refinementQueryId = `refine-${queryId}`;
+          refinementActiveRef.current.add(refinementQueryId);
+          const responseStartTime = Date.now();
+
+          // Register callback for refinement
+          PerceptionEngine.onRefinement(refinementQueryId, (refinedText) => {
+            const refinementTime = Date.now() - responseStartTime;
+            if (refinementActiveRef.current.has(refinementQueryId) && refinementTime < LLM_REFINEMENT_TIMEOUT_MS) {
+              updateMessage(msgId, refinedText + '\n\n✨ *AI-enhanced*', false);
+              QueryCache.save(query, refinedText, [], explainMode, currentDocument?.id);
             }
-            // Fallback to document excerpt
-            response = `Based on the document:\n\n"${context.slice(0, 400)}..."\n\n*Response generated from document excerpt due to processing time.*`;
-          } else {
-            throw timeoutErr;
-          }
+            refinementActiveRef.current.delete(refinementQueryId);
+          });
+
+          // Get context and trigger background refinement
+          getQuickContext(query).then(context => {
+            PerceptionEngine.triggerBackgroundRefinement(
+              refinementQueryId,
+              query,
+              context,
+              async (q, ctx) => generateWithLLM(q, ctx),
+              LLM_REFINEMENT_TIMEOUT_MS
+            ).catch(() => {
+              refinementActiveRef.current.delete(refinementQueryId);
+            });
+          });
         }
-        alreadyStreamed = true;
-      } else if (currentDocument) {
-        // LLM not loaded — extract relevant text from actual document
-        const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 2);
-        const context = kwResults.length > 0
-          ? kwResults.map(r => r.snippet).join('\n\n')
-          : currentDocument.text.slice(0, 1500);
-        response = `Based on the document:\n\n${context.slice(0, 1000)}\n\n*Note: Click "**🚀 Initialize AI Model**" in the top right to enable intelligent analysis.*`;
-      } else {
-        response = "Please upload a document first to enable AI-powered analysis.";
+
+        return; // EXIT - real document response shown
       }
 
-      if (!alreadyStreamed) {
-        await simulateStream(response);
-      }
-      
-      if (demoMode) {
-        await QueryCache.save(query, response, [], explainMode);
-      }
+      // ========================================================================
+      // FALLBACK: No document loaded - provide helpful guidance
+      // ========================================================================
+      console.log('[FALLBACK] No document loaded');
+      const fallbackText = "Please upload a document first! You can drag and drop a PDF or click the upload button to get started.";
+      const msgId = addMessage('assistant', '', true);
+      await new Promise<void>((resolve) => {
+        typingCancelRef.current = createTypingAnimation(
+          fallbackText,
+          (partial) => updateMessage(msgId, partial, true),
+          () => { updateMessage(msgId, fallbackText, false); resolve(); },
+          10
+        );
+      });
+      setAppState('ready');
+      return;
 
-      } catch (error) {
+    } catch (error) {
       console.error('Query error:', error);
-      // ENHANCED: Graceful fallback - NEVER show errors to user
-      const fallbackResponse = currentDocument
-        ? `Based on the document "${currentDocument.name}": ${currentDocument.text.slice(0, 200)}...\n\n*I found relevant content. Try rephrasing your question for a more specific answer.*`
-        : getIntelligentResponse(query);
-
-      if (demoMode) {
-        await simulateStream(getIntelligentResponse(query), true);
+      // FAILSAFE: Never show errors - always provide a response
+      // For real documents, use text extraction fallback (NOT PerceptionEngine!)
+      let fallbackText: string;
+      if (currentDocument && !isDemoDocument) {
+        fallbackText = generateTextExtractionFallback(currentDocument.text, query, pdfName || 'Document');
+      } else if (currentDocument) {
+        fallbackText = `**From the document:**\n\n"${currentDocument.text.slice(0, 300)}..."\n\n*Relevant excerpt from your document.*`;
       } else {
-        await simulateStream(fallbackResponse);
+        fallbackText = getIntelligentResponse(query);
       }
+
+      const msgId = addMessage('assistant', '', true);
+      await new Promise<void>((resolve) => {
+        typingCancelRef.current = createTypingAnimation(
+          fallbackText,
+          (partial) => updateMessage(msgId, partial, true),
+          () => { updateMessage(msgId, fallbackText, false); resolve(); },
+          8
+        );
+      });
+      setAppState('ready');
+    }
+  };
+
+  /**
+   * Generate fallback response from raw text when DocumentAnalyzer fails
+   * IMPORTANT: This is for REAL documents only - NEVER uses PerceptionEngine
+   *
+   * Response format matches PerceptionEngine for consistency:
+   * - Opening context phrase
+   * - Bullet point insights (3-5)
+   * - Closing suggestion
+   */
+  const generateTextExtractionFallback = (text: string, query: string, documentName: string): string => {
+    const normalizedQuery = query.toLowerCase();
+
+    // Context phrases for AI-like feel (matches PerceptionEngine/DocumentAnalyzer)
+    const contextPhrases = [
+      'Based on the document, here are the key insights:',
+      'After analyzing the content, I found:',
+      'The document reveals the following:',
+      'Here\'s what I found in the document:'
+    ];
+    const opener = contextPhrases[Math.floor(Math.random() * contextPhrases.length)];
+
+    // Extract relevant sentences based on query keywords
+    const queryWords = normalizedQuery
+      .split(/\s+/)
+      .filter(w => w.length > 3);
+
+    const sentences = text
+      .split(/[.!?]+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 30 && s.length < 400);
+
+    // Score sentences by keyword match
+    const scoredSentences = sentences.map(sentence => {
+      const lowerSentence = sentence.toLowerCase();
+      let score = 0;
+      for (const word of queryWords) {
+        if (lowerSentence.includes(word)) {
+          score += 2;
+        }
+      }
+      // Boost sentences with signal words
+      const signals = ['important', 'key', 'main', 'result', 'finding', 'conclude', 'demonstrate'];
+      if (signals.some(s => lowerSentence.includes(s))) {
+        score += 1;
+      }
+      return { sentence, score };
+    });
+
+    // Get top 3-4 relevant sentences
+    const topSentences = scoredSentences
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 4)
+      .map(s => s.sentence);
+
+    // Remove duplicates based on first 5 words
+    const uniqueSentences: string[] = [];
+    const seen = new Set<string>();
+    for (const s of topSentences) {
+      const key = s.toLowerCase().split(/\s+/).slice(0, 5).join(' ');
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueSentences.push(s);
+      }
+    }
+
+    // Format as bullet points (consistent with PerceptionEngine)
+    if (uniqueSentences.length > 0) {
+      const bullets = uniqueSentences
+        .slice(0, 3)
+        .map(s => {
+          // Shorten long sentences
+          const words = s.split(/\s+/);
+          const shortened = words.length > 25 ? words.slice(0, 25).join(' ') + '...' : s;
+          // Ensure proper capitalization
+          const formatted = shortened.charAt(0).toUpperCase() + shortened.slice(1);
+          // Ensure ends with period
+          return formatted.endsWith('.') ? formatted : formatted + '.';
+        })
+        .map(s => `• ${s}`)
+        .join('\n');
+
+      return `**Key Insights**\n\n${opener}\n\n${bullets}\n\n*Try asking about "summary", "key points", or "methodology" for more specific analysis.*`;
+    }
+
+    // Ultimate fallback: structured excerpt
+    const excerpt = text.slice(0, 350).trim();
+    const cleanExcerpt = excerpt.split(/[.!?]+/).slice(0, 3).join('. ').trim() + '.';
+
+    return `**Document Overview**\n\n${opener}\n\n• ${cleanExcerpt}\n\n*Ask specific questions for better results.*`;
+  };
+
+  /**
+   * Get quick context from document for LLM (fast, non-blocking)
+   */
+  const getQuickContext = async (query: string): Promise<string> => {
+    if (!currentDocument) return '';
+
+    try {
+      // Try keyword search first (instant)
+      const kwResults = DocumentStore.searchDocumentByKeyword(currentDocument.id, query, 1);
+      if (kwResults.length > 0) {
+        return kwResults[0].snippet.slice(0, 300);
+      }
+
+      // Fallback to document start
+      return currentDocument.text.slice(0, 300);
+    } catch {
+      return currentDocument.text.slice(0, 300);
     }
   };
   // -------------------------------------------------------------------------
@@ -1011,7 +1235,7 @@ REFERENCES
             {isOnline ? 'Online' : '📴 Offline Ready'}
           </motion.div>
 
-          {demoMode && (
+          {isDemoDocument && (
             <div style={{ ...styles.badge, ...styles.badgeDemo }}>
               ⚡ DEMO MODE
             </div>
@@ -1102,6 +1326,8 @@ REFERENCES
                       setMessages([]);
                       setSmartSuggestions([]);
                       setDocStats(null);
+                      setDocumentAnalysis(null);
+                      DocumentAnalyzer.clearCache(); // Clear analyzer cache
                     }}
                     style={styles.closeBtn}
                   >

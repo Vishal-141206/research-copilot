@@ -16,9 +16,11 @@ export const SAMPLE_QUERIES = [
   'How does this compare to existing work?',
 ];
 
-// Comprehensive demo responses - covers many query variations
+// Comprehensive demo responses - covers many query variations (30+ instant responses)
 export const DEMO_RESPONSES = new Map<string, string>([
-  // Summary variations
+  // ============================================================================
+  // SUMMARY VARIATIONS (10+)
+  // ============================================================================
   [
     'summarize the key findings',
     '**Key Findings:**\n\n1. **40% Performance Improvement** - Local AI processing achieves faster response times than cloud APIs after initial loading\n2. **100% Data Privacy** - All processing happens on-device with zero network transmission\n3. **Offline Capability** - System works seamlessly without internet connection'
@@ -30,6 +32,34 @@ export const DEMO_RESPONSES = new Map<string, string>([
   [
     'summary',
     'The paper introduces a privacy-preserving AI document assistant that runs entirely client-side. Main achievements:\n\n• Sub-second response times after initial load\n• Zero data transmission ensures complete confidentiality\n• Full functionality in offline environments\n• Cross-platform compatibility via web technologies'
+  ],
+  [
+    'give me a summary',
+    '**Executive Summary:**\n\nThis document describes an AI system that runs entirely in your browser. It processes documents locally, ensuring your data never leaves your device. The system achieves cloud-level performance while maintaining complete privacy and offline capability.'
+  ],
+  [
+    'brief summary',
+    'Key points: Local AI processing with 40% faster responses than cloud APIs, 100% privacy (no data transmission), and full offline support. The system uses WebAssembly and model quantization for efficient browser-based inference.'
+  ],
+  [
+    'can you summarize',
+    '**Quick Summary:**\n\n• **What:** AI-powered document analysis running in-browser\n• **How:** WebAssembly + quantized models + semantic search\n• **Why:** Privacy, speed, and offline capability\n• **Result:** Cloud-level AI without cloud dependencies'
+  ],
+  [
+    'tldr',
+    '**TL;DR:** This is a privacy-first AI system that analyzes documents entirely in your browser. No cloud, no data transmission, works offline. 40% faster than cloud APIs after initial load.'
+  ],
+  [
+    'overview',
+    '**Document Overview:**\n\nThis research demonstrates browser-based AI for document analysis. The system processes everything locally using WebAssembly, ensuring data never leaves the device. It achieves comparable accuracy to cloud solutions while eliminating privacy concerns and enabling offline use.'
+  ],
+  [
+    'main points',
+    '**Main Points:**\n\n1. AI can run efficiently in web browsers using WebAssembly\n2. Local processing ensures complete data privacy\n3. Performance matches or exceeds cloud-based alternatives\n4. Full functionality works without internet connection'
+  ],
+  [
+    'what is the gist',
+    'The gist: Sophisticated AI document analysis can run entirely in your browser, keeping your data private while delivering fast, accurate results - even offline.'
   ],
   // Arguments/thesis
   [
@@ -100,6 +130,69 @@ export const DEMO_RESPONSES = new Map<string, string>([
     'compare',
     '**Comparison with Cloud APIs:**\n\n| Aspect | This System | Cloud API |\n|--------|-------------|------------|\n| Privacy | 100% local | Data sent to server |\n| Latency | Sub-second | Network dependent |\n| Cost | Free after download | Per-query charges |\n| Offline | Full support | Requires internet |\n\n*On-device wins for privacy-sensitive use cases.*'
   ],
+  // ============================================================================
+  // ADDITIONAL QUERY TYPES (15+)
+  // ============================================================================
+  [
+    'what is this about',
+    'This document is about **on-device AI processing** - running sophisticated machine learning models directly in web browsers. The key innovation is achieving cloud-level AI capabilities while keeping all data completely private and enabling offline use.'
+  ],
+  [
+    'key takeaways',
+    '**Key Takeaways:**\n\n1. Browser-based AI is now production-ready\n2. Privacy and performance can coexist\n3. Offline capability opens new use cases\n4. WebAssembly enables near-native performance\n5. Quantization makes large models practical'
+  ],
+  [
+    'important points',
+    '**Important Points:**\n\n• **Privacy:** All processing happens locally - data never leaves your device\n• **Speed:** Sub-second responses after initial model load\n• **Reliability:** Works without internet connection\n• **Cost:** No per-query API charges'
+  ],
+  [
+    'what did you find',
+    'Based on my analysis:\n\n1. The document discusses browser-based AI processing\n2. Key innovation is privacy-preserving local inference\n3. Performance matches cloud-based alternatives\n4. System works fully offline after initial setup'
+  ],
+  [
+    'analysis',
+    '**Document Analysis:**\n\nThis is a technical paper on client-side AI systems. It presents a novel approach to document analysis that prioritizes privacy and offline capability. The methodology involves RAG (Retrieval-Augmented Generation) with semantic embeddings and quantized language models.'
+  ],
+  [
+    'insights',
+    '**Key Insights:**\n\n• WebAssembly enables desktop-quality AI in browsers\n• Model quantization reduces size 4x with minimal quality loss\n• Semantic search outperforms keyword matching\n• User experience benefits from streaming responses'
+  ],
+  [
+    'benefits',
+    '**Benefits of This Approach:**\n\n✓ Complete data privacy - nothing leaves your device\n✓ No API costs or usage limits\n✓ Works offline after initial setup\n✓ Faster responses than network-based solutions\n✓ Cross-platform compatibility'
+  ],
+  [
+    'advantages',
+    '**Advantages:**\n\n1. **Privacy:** 100% local processing\n2. **Speed:** Sub-second latency\n3. **Cost:** Free after download\n4. **Reliability:** No network dependency\n5. **Compliance:** Easier data protection'
+  ],
+  [
+    'use cases',
+    '**Use Cases:**\n\n• Legal document review (confidentiality required)\n• Medical records analysis (HIPAA compliance)\n• Financial document processing (privacy-sensitive)\n• Offline research in remote locations\n• Air-gapped secure environments'
+  ],
+  [
+    'applications',
+    '**Applications:**\n\nThis technology enables privacy-preserving AI for:\n\n• Document summarization\n• Question answering\n• Information extraction\n• Semantic search\n• Content analysis\n\nAll without sending data to external servers.'
+  ],
+  [
+    'how to use',
+    '**How to Use:**\n\n1. Upload your PDF document\n2. Wait for processing (one-time setup)\n3. Ask questions in natural language\n4. Get instant AI-powered answers\n\nNo account or internet connection needed after initial load!'
+  ],
+  [
+    'features',
+    '**Key Features:**\n\n• 📄 PDF document analysis\n• 🔍 Semantic search with embeddings\n• 💬 Natural language Q&A\n• 🎤 Voice input support\n• 🔒 100% offline capable\n• ⚡ Sub-second responses'
+  ],
+  [
+    'capabilities',
+    '**System Capabilities:**\n\n• Summarize documents of any length\n• Answer specific questions about content\n• Explain complex passages simply\n• Extract key terms and definitions\n• Compare different sections\n• Generate study materials'
+  ],
+  [
+    'architecture',
+    '**System Architecture:**\n\n1. **Frontend:** React + TypeScript\n2. **AI Runtime:** WebAssembly (llama.cpp)\n3. **Embeddings:** MiniLM-L6-v2 (384-dim)\n4. **LLM:** LFM2-350M (4-bit quantized)\n5. **Storage:** IndexedDB for persistence'
+  ],
+  [
+    'technical details',
+    '**Technical Details:**\n\n• **Model Size:** ~200MB (quantized)\n• **Embedding Dim:** 384 dimensions\n• **Chunk Size:** 500 tokens with 50 overlap\n• **Inference:** WebGPU/SIMD/CPU fallback\n• **Search:** Cosine similarity + keyword hybrid'
+  ],
   // Generic/fallback
   [
     'default',
@@ -134,41 +227,71 @@ export function getDemoResponse(query: string): string | null {
   }
 
   // Enhanced fuzzy matching based on keywords
-  if (normalized.includes('summar') || normalized.includes('overview') || normalized.includes('gist')) {
+  if (normalized.includes('summar') || normalized.includes('overview') || normalized.includes('gist') || normalized.includes('tldr') || normalized.includes('brief')) {
     return DEMO_RESPONSES.get('summarize') || DEMO_RESPONSES.get('summary')!;
   }
-  if (normalized.includes('finding') || normalized.includes('result') || normalized.includes('discover')) {
+  if (normalized.includes('finding') || normalized.includes('result') || normalized.includes('discover') || normalized.includes('outcome')) {
     return DEMO_RESPONSES.get('findings')!;
   }
   if (normalized.includes('argument') || normalized.includes('thesis') || normalized.includes('claim') || normalized.includes('main point')) {
     return DEMO_RESPONSES.get('main argument')!;
   }
-  if (normalized.includes('method') || normalized.includes('how') || normalized.includes('approach') || normalized.includes('work') || normalized.includes('pipeline')) {
+  if (normalized.includes('method') || normalized.includes('how') || normalized.includes('approach') || normalized.includes('work') || normalized.includes('pipeline') || normalized.includes('process')) {
     return DEMO_RESPONSES.get('methodology') || DEMO_RESPONSES.get('how does it work')!;
   }
-  if (normalized.includes('conclu') || normalized.includes('takeaway') || normalized.includes('final')) {
-    return DEMO_RESPONSES.get('conclusions')!;
+  if (normalized.includes('conclu') || normalized.includes('takeaway') || normalized.includes('final') || normalized.includes('end result')) {
+    return DEMO_RESPONSES.get('conclusions') || DEMO_RESPONSES.get('key takeaways')!;
   }
-  if (normalized.includes('term') || normalized.includes('defin') || normalized.includes('glossar') || normalized.includes('vocab') || normalized.includes('mean')) {
+  if (normalized.includes('term') || normalized.includes('defin') || normalized.includes('glossar') || normalized.includes('vocab') || normalized.includes('mean') || normalized.includes('what is')) {
     return DEMO_RESPONSES.get('key terms')!;
   }
-  if (normalized.includes('explain') || normalized.includes('what is') || normalized.includes('tell me')) {
+  if (normalized.includes('explain') || normalized.includes('tell me') || normalized.includes('describe') || normalized.includes('elaborate')) {
     return DEMO_RESPONSES.get('explain')!;
   }
-  if (normalized.includes('contribut') || normalized.includes('novel') || normalized.includes('innovat') || normalized.includes('new')) {
+  if (normalized.includes('contribut') || normalized.includes('novel') || normalized.includes('innovat') || normalized.includes('new') || normalized.includes('advance')) {
     return DEMO_RESPONSES.get('what is the main contribution')!;
   }
-  if (normalized.includes('compar') || normalized.includes('differ') || normalized.includes('versus') || normalized.includes('vs') || normalized.includes('better')) {
+  if (normalized.includes('compar') || normalized.includes('differ') || normalized.includes('versus') || normalized.includes('vs') || normalized.includes('better') || normalized.includes('contrast')) {
     return DEMO_RESPONSES.get('compare')!;
   }
-  if (normalized.includes('privacy') || normalized.includes('secure') || normalized.includes('safe')) {
+  if (normalized.includes('privacy') || normalized.includes('secure') || normalized.includes('safe') || normalized.includes('protect') || normalized.includes('confidential')) {
     return '**Privacy Features:**\n\n• 100% local processing - data never leaves device\n• No network transmission\n• Works fully offline\n• Compliant with data protection regulations';
   }
-  if (normalized.includes('offline') || normalized.includes('internet') || normalized.includes('wifi')) {
+  if (normalized.includes('offline') || normalized.includes('internet') || normalized.includes('wifi') || normalized.includes('network') || normalized.includes('connectivity')) {
     return '**Offline Capability:**\n\n• Full functionality without internet\n• Models cached locally after download\n• Works in airplane mode\n• No server dependencies';
   }
-  if (normalized.includes('fast') || normalized.includes('speed') || normalized.includes('performance') || normalized.includes('latency')) {
+  if (normalized.includes('fast') || normalized.includes('speed') || normalized.includes('performance') || normalized.includes('latency') || normalized.includes('quick')) {
     return '**Performance:**\n\n• Sub-second responses after model load\n• 40% faster than cloud APIs\n• Streaming responses for perceived speed\n• Cached queries return instantly';
+  }
+  if (normalized.includes('about') || normalized.includes('this document') || normalized.includes('paper') || normalized.includes('what is this')) {
+    return DEMO_RESPONSES.get('what is this about')!;
+  }
+  if (normalized.includes('takeaway') || normalized.includes('key point') || normalized.includes('important')) {
+    return DEMO_RESPONSES.get('key takeaways') || DEMO_RESPONSES.get('important points')!;
+  }
+  if (normalized.includes('insight') || normalized.includes('learn')) {
+    return DEMO_RESPONSES.get('insights')!;
+  }
+  if (normalized.includes('benefit') || normalized.includes('advantage') || normalized.includes('why use') || normalized.includes('pros')) {
+    return DEMO_RESPONSES.get('benefits') || DEMO_RESPONSES.get('advantages')!;
+  }
+  if (normalized.includes('use case') || normalized.includes('application') || normalized.includes('use for') || normalized.includes('scenario')) {
+    return DEMO_RESPONSES.get('use cases') || DEMO_RESPONSES.get('applications')!;
+  }
+  if (normalized.includes('feature') || normalized.includes('capabilit') || normalized.includes('can it') || normalized.includes('what can')) {
+    return DEMO_RESPONSES.get('features') || DEMO_RESPONSES.get('capabilities')!;
+  }
+  if (normalized.includes('architect') || normalized.includes('technical') || normalized.includes('stack') || normalized.includes('built with')) {
+    return DEMO_RESPONSES.get('architecture') || DEMO_RESPONSES.get('technical details')!;
+  }
+  if (normalized.includes('limit') || normalized.includes('challenge') || normalized.includes('problem') || normalized.includes('drawback') || normalized.includes('cons')) {
+    return '**Limitations:**\n\n• Initial model download required (~200MB)\n• Memory requirements (4GB+ RAM)\n• WebGPU availability varies by browser\n• Complex documents need more processing time';
+  }
+  if (normalized.includes('analysis') || normalized.includes('analyze')) {
+    return DEMO_RESPONSES.get('analysis')!;
+  }
+  if (normalized.includes('help') || normalized.includes('how to') || normalized.includes('guide') || normalized.includes('tutorial')) {
+    return DEMO_RESPONSES.get('how to use')!;
   }
 
   // Fallback to default
@@ -313,7 +436,7 @@ export async function preloadDemoResources(): Promise<void> {
 export async function injectDemoCache(): Promise<void> {
   const { QueryCache } = await import('./queryCache');
 
-  // Comprehensive list of queries likely used in demo
+  // Comprehensive list of queries likely used in demo (30+)
   const queriesToCache = [
     // Primary demo flow queries
     'Summarize the key findings',
@@ -325,6 +448,12 @@ export async function injectDemoCache(): Promise<void> {
     'summarize',
     'summary',
     'give me a summary',
+    'brief summary',
+    'can you summarize',
+    'tldr',
+    'overview',
+    'main points',
+    'what is the gist',
     'findings',
     'methodology',
     'conclusions',
@@ -340,12 +469,29 @@ export async function injectDemoCache(): Promise<void> {
     'key terms',
     'compare',
 
-    // Other likely queries
+    // Additional common queries
     'how does it work',
     'what is the main contribution',
     'what are the main points',
     'privacy',
-    'offline'
+    'offline',
+    'what is this about',
+    'key takeaways',
+    'important points',
+    'what did you find',
+    'analysis',
+    'insights',
+    'benefits',
+    'advantages',
+    'use cases',
+    'applications',
+    'features',
+    'capabilities',
+    'architecture',
+    'technical details',
+    'limitations',
+    'help',
+    'how to use'
   ];
 
   // Cache for all modes
