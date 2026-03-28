@@ -537,7 +537,7 @@ class DocumentStoreClass {
         };
       })
       .sort((a, b) => b.score - a.score)
-      .slice(0, Math.min(topK, 2));
+      .slice(0, Math.min(topK, 4));
   }
 
   private embedQuery(text: string): Promise<number[]> {

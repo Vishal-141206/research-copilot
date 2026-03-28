@@ -17,6 +17,7 @@ import { QueryCache, detectCacheIntent } from '../utils/queryCache';
 import { getDemoResponse, injectDemoCache } from '../utils/demoHelpers';
 import { PerceptionEngine } from '../utils/perceptionEngine';
 import { DocumentAnalyzer, DocumentAnalysis } from '../utils/documentAnalyzer';
+import { OutputTransformer } from '../utils/outputTransformer';
 import {
   ensureLLMRuntime,
   getAccelerationMode,
@@ -132,41 +133,161 @@ function getIntelligentResponse(query: string): string {
   return getDemoResponse(query) || DEMO_RESPONSES.default;
 }
 
-/** Simple markdown-to-HTML renderer for AI responses */
+/** Simple markdown-to-HTML renderer for AI responses - each element on separate line */
 function renderMarkdown(text: string): string {
   if (!text) return '';
-  let html = text
+  
+  // Split into lines and process each
+  const lines = text.split('\n');
+  const htmlParts: string[] = [];
+  let inList = false;
+  
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (inList) {
+        htmlParts.push('</ul>');
+        inList = false;
+      }
+      continue;
+    }
+    
     // Escape HTML
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    // Headers
-    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-    // Bold
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    // Italic
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    // Inline code
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    // Bullet points (• or - or *)
-    .replace(/^[•\-\*] (.+)$/gm, '<li>$1</li>')
-    // Numbered lists
-    .replace(/^\d+\.\s(.+)$/gm, '<li>$1</li>')
-    // Horizontal rule
-    .replace(/^---$/gm, '<hr/>')
-    // Line breaks
-    .replace(/\n\n/g, '</p><p>')
-    .replace(/\n/g, '<br/>');
-  // Wrap consecutive <li> in <ul>
-  html = html.replace(/(<li>.*?<\/li>(?:<br\/>)?)+/gs, (match) => {
-    const cleaned = match.replace(/<br\/>/g, '');
-    return '<ul>' + cleaned + '</ul>';
-  });
-  // Wrap in paragraph
-  html = '<p>' + html + '</p>';
-  // Clean empty paragraphs
-  html = html.replace(/<p><\/p>/g, '').replace(/<p>(<h[123]>)/g, '$1').replace(/(<\/h[123]>)<\/p>/g, '$1');
-  return html;
+    const escaped = trimmed
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    
+    // Check for headers (### ## #)
+    const h3Match = escaped.match(/^### (.+)$/);
+    const h2Match = escaped.match(/^## (.+)$/);
+    const h1Match = escaped.match(/^# (.+)$/);
+    
+    if (h3Match) {
+      if (inList) { htmlParts.push('</ul>'); inList = false; }
+      htmlParts.push(`<h3 class="md-title">${h3Match[1]}</h3>`);
+      continue;
+    }
+    if (h2Match) {
+      if (inList) { htmlParts.push('</ul>'); inList = false; }
+      htmlParts.push(`<h2 class="md-title">${h2Match[1]}</h2>`);
+      continue;
+    }
+    if (h1Match) {
+      if (inList) { htmlParts.push('</ul>'); inList = false; }
+      htmlParts.push(`<h1 class="md-title">${h1Match[1]}</h1>`);
+      continue;
+    }
+    
+    // Check for bold title (**Title**)
+    const boldTitleMatch = escaped.match(/^\*\*([^*]+)\*\*$/);
+    if (boldTitleMatch) {
+      if (inList) { htmlParts.push('</ul>'); inList = false; }
+      htmlParts.push(`<h3 class="md-title">${boldTitleMatch[1]}</h3>`);
+      continue;
+    }
+    
+    // Check for bullet points (• - *)
+    const bulletMatch = escaped.match(/^[•\-\*]\s+(.+)$/);
+    if (bulletMatch) {
+      if (!inList) {
+        htmlParts.push('<ul class="md-list">');
+        inList = true;
+      }
+      // Process inline formatting
+      const content = bulletMatch[1]
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>');
+      htmlParts.push(`<li>${content}</li>`);
+      continue;
+    }
+    
+    // Check for numbered list
+    const numMatch = escaped.match(/^\d+\.\s+(.+)$/);
+    if (numMatch) {
+      if (!inList) {
+        htmlParts.push('<ul class="md-list numbered">');
+        inList = true;
+      }
+      const content = numMatch[1]
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>');
+      htmlParts.push(`<li>${content}</li>`);
+      continue;
+    }
+    
+    // Regular paragraph
+    if (inList) { htmlParts.push('</ul>'); inList = false; }
+    const content = escaped
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g, '<em>$1</em>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
+    htmlParts.push(`<p class="md-para">${content}</p>`);
+  }
+  
+  // Close any open list
+  if (inList) {
+    htmlParts.push('</ul>');
+  }
+  
+  return htmlParts.join('');
+}
+
+/**
+ * TypewriterText component - displays text with character-by-character typing effect
+ */
+function TypewriterText({ 
+  content, 
+  speed = 12, 
+  onComplete 
+}: { 
+  content: string; 
+  speed?: number; 
+  onComplete?: () => void;
+}) {
+  const [displayedContent, setDisplayedContent] = useState('');
+  const [isComplete, setIsComplete] = useState(false);
+  const contentRef = useRef(content);
+  const indexRef = useRef(0);
+  
+  useEffect(() => {
+    // Reset if content changes
+    if (content !== contentRef.current) {
+      contentRef.current = content;
+      indexRef.current = 0;
+      setDisplayedContent('');
+      setIsComplete(false);
+    }
+    
+    if (isComplete) return;
+    
+    const timer = setInterval(() => {
+      if (indexRef.current < content.length) {
+        // Add characters in chunks for smoother appearance
+        const chunkSize = Math.min(3, content.length - indexRef.current);
+        const nextChunk = content.slice(indexRef.current, indexRef.current + chunkSize);
+        indexRef.current += chunkSize;
+        setDisplayedContent(prev => prev + nextChunk);
+      } else {
+        setIsComplete(true);
+        onComplete?.();
+        clearInterval(timer);
+      }
+    }, speed);
+    
+    return () => clearInterval(timer);
+  }, [content, speed, isComplete, onComplete]);
+  
+  // Render with markdown - show cursor while typing
+  const html = renderMarkdown(displayedContent);
+  
+  return (
+    <div className="md-content typewriter-container">
+      <div dangerouslySetInnerHTML={{ __html: html }} />
+      {!isComplete && <span className="typewriter-cursor">|</span>}
+    </div>
+  );
 }
 
 /** Generate context-aware suggestions from document text */
@@ -340,6 +461,144 @@ function buildStructuredAnswer(query: string, ...sources: Array<string | null | 
   return `Based on the document:\n- ${finalPoints.join('\n- ')}`;
 }
 
+function normalizeAnswerText(text: string): string {
+  return (text || '')
+    .replace(/\r/g, '')
+    .replace(/Ã¢â‚¬Â¢/g, '-')
+    .replace(/â€¢/g, '-')
+    .replace(/^\s*answer:\s*/i, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function isPlaceholderAnswer(text: string): boolean {
+  const normalized = normalizeAnswerText(text).toLowerCase();
+  if (!normalized) return true;
+
+  return (
+    normalized === 'processing...' ||
+    normalized.includes('analyzing relevant sections') ||
+    normalized.includes('extracting important details') ||
+    normalized.includes('preparing response')
+  );
+}
+
+function looksFormattedAnswer(text: string): boolean {
+  return /(^|\n)(\*\*|#|- |\d+\. )/.test(text) || text.includes('\n\n');
+}
+
+/** Clean and format a sentence - NO LENGTH BOUNDS */
+function ensureSentence(text: string): string {
+  const compact = stripPresentationNoise(text)
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .trim();
+
+  if (!compact || compact.length < 10) return '';
+
+  const normalized = compact.charAt(0).toUpperCase() + compact.slice(1);
+  // Clean trailing punctuation issues
+  const cleaned = normalized.replace(/[,:;\s]+$/, '');
+  return /[.!?]$/.test(cleaned) ? cleaned : `${cleaned}.`;
+}
+
+function collectSupportingLines(limit: number, ...sources: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+
+  for (const source of sources) {
+    for (const candidate of extractCandidatePoints(source || '')) {
+      const line = ensureSentence(candidate);
+      const key = line.toLowerCase();
+      if (!line || seen.has(key)) continue;
+      seen.add(key);
+      lines.push(line);
+      if (lines.length >= limit) {
+        return lines;
+      }
+    }
+  }
+
+  return lines;
+}
+
+/** Extract evidence sentences - NO LENGTH BOUNDS */
+function extractEvidenceSentences(query: string, retrievedContext: string, limit: number = 5): string[] {
+  if (!retrievedContext) return [];
+
+  const normalizedQuery = query.toLowerCase();
+  const queryTerms = normalizedQuery
+    .split(/\s+/)
+    .map((term) => term.replace(/[^a-z0-9]/g, ''))
+    .filter((term) => term.length >= 3);
+
+  const seen = new Set<string>();
+  const scored = retrievedContext
+    .split(/\n\n+/)
+    .flatMap((chunk) => {
+      const cleanedChunk = chunk
+        .replace(/^\[\d+\]\s*/, '')
+        .replace(/[^\x20-\x7E]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      return cleanedChunk
+        .split(/[.!?]+/)
+        .map((sentence) => ensureSentence(sentence))
+        .filter((sentence) => sentence.length >= 20); // Only filter very short, no upper bound
+    })
+    .map((sentence) => {
+      const lower = sentence.toLowerCase();
+      const overlap = queryTerms.reduce((score, term) => score + (lower.includes(term) ? 2 : 0), 0);
+      const phraseBonus = normalizedQuery.length > 8 && lower.includes(normalizedQuery) ? 2.5 : 0;
+      const numericBonus = /\d/.test(sentence) ? 0.35 : 0;
+      // Prefer longer, more detailed sentences
+      const detailBonus = sentence.length >= 80 ? 0.6 : sentence.length >= 50 ? 0.3 : 0;
+
+      return {
+        sentence,
+        score: overlap + phraseBonus + numericBonus + detailBonus,
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .filter(({ sentence }) => {
+      const key = sentence.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  const positiveMatches = scored
+    .filter((item) => item.score > 0)
+    .slice(0, limit)
+    .map((item) => item.sentence);
+
+  if (positiveMatches.length > 0) {
+    return positiveMatches;
+  }
+
+  return scored.slice(0, limit).map((item) => item.sentence);
+}
+
+function chooseDisplayAnswer(query: string, ...sources: Array<string | null | undefined>): string {
+  for (const source of sources) {
+    const cleaned = normalizeAnswerText(source || '');
+    if (!cleaned || isPlaceholderAnswer(cleaned)) continue;
+    if (looksFormattedAnswer(cleaned) && cleaned.length > 32) {
+      return cleaned;
+    }
+  }
+
+  for (const source of sources) {
+    const cleaned = normalizeAnswerText(source || '');
+    if (!cleaned || isPlaceholderAnswer(cleaned)) continue;
+    if (cleaned.length > 32) {
+      return `**Answer**\n\n${cleaned}`;
+    }
+  }
+
+  return buildStructuredAnswer(query, ...sources);
+}
+
 // ============================================================================
 // MAIN COMPONENT
 // ============================================================================
@@ -371,6 +630,7 @@ export function HackathonWinner() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [explainMode, setExplainMode] = useState<ExplainMode>('simple');
+  const [animatingMessageId, setAnimatingMessageId] = useState<string | null>(null); // Track which message is typing
 
   // Voice state
   const [isRecording, setIsRecording] = useState(false);
@@ -533,9 +793,9 @@ export function HackathonWinner() {
       return { context: '', sourceCount: 0, retrievalMode: 'none' as const };
     }
 
-    const hits = await DocumentStore.searchDocument(currentDocument.id, query, 2);
+    const hits = await DocumentStore.searchDocument(currentDocument.id, query, 3);
     const context = hits
-      .map((hit, index) => `[${index + 1}] ${hit.chunk.replace(/\s+/g, ' ').trim().slice(0, 120)}`)
+      .map((hit, index) => `[${index + 1}] ${hit.chunk.replace(/\s+/g, ' ').trim().slice(0, 220)}`)
       .join('\n\n');
 
     return {
@@ -550,80 +810,53 @@ export function HackathonWinner() {
       ? DocumentAnalyzer.generateResponse(documentAnalysis, query, pdfName || 'Document')
       : '';
     const extractionFallback = generateTextExtractionFallback(currentDocument?.text || '', query, pdfName || 'Document');
-    const fallback = extractionFallback;
-    const retrievalMode = _retrievalMode;
+    const fallback = chooseDisplayAnswer(query, analysisResponse, extractionFallback);
 
     if (!retrievedContext) {
-      return buildStructuredAnswer(query, analysisResponse, extractionFallback);
+      return fallback;
     }
 
-    return buildStructuredAnswer(query, retrievedContext, analysisResponse, extractionFallback);
+    // Get more evidence - let content quality decide quantity (up to 8)
+    const evidenceLines = extractEvidenceSentences(query, retrievedContext, 8);
+    if (evidenceLines.length === 0) {
+      return fallback;
+    }
 
-    const queryTerms = query
-      .toLowerCase()
-      .split(/\s+/)
-      .map((term) => term.replace(/[^a-z0-9]/g, ''))
-      .filter((term) => term.length >= 3);
+    // Get supplemental lines from analysis
+    const supplemental = collectSupportingLines(5, analysisResponse, extractionFallback)
+      .filter((line) => !evidenceLines.some((evidence) => evidence.toLowerCase() === line.toLowerCase()));
+    
+    // Combine evidence with supplemental, keeping unique quality sentences
+    const allLines = [...evidenceLines, ...supplemental];
+    const seen = new Set<string>();
+    const uniqueLines = allLines.filter(line => {
+      const key = line.toLowerCase().slice(0, 50);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return line.length >= 30; // Only include substantial sentences
+    });
 
-    const evidenceLines = retrievedContext
-      .split(/\n\n/)
-      .flatMap((chunk) => {
-        const cleanedChunk = chunk
-          .replace(/^\[\d+\]\s*/, '')
-          .replace(/[^\x20-\x7E]+/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim();
+    // Select 3-6 lines based on content quality
+    const selectedLines = uniqueLines.slice(0, Math.max(3, Math.min(6, uniqueLines.length)));
+    
+    if (selectedLines.length === 0) {
+      return fallback;
+    }
 
-        return cleanedChunk
-          .split(/[.!?]+/)
-          .map((sentence) => sentence.replace(/[^\x20-\x7E]+/g, ' ').replace(/\s+/g, ' ').trim())
-          .filter((sentence) => sentence.length >= 28 && sentence.length <= 220);
-      })
-      .map((sentence) => {
-        const lower = sentence.toLowerCase();
-        const overlap = queryTerms.reduce((score, term) => score + (lower.includes(term) ? 2 : 0), 0);
-        const numericBonus = /\d/.test(sentence) ? 0.4 : 0;
-        const lengthBonus = sentence.length >= 60 && sentence.length <= 170 ? 0.5 : 0;
-        return {
-          sentence: `${sentence}${sentence.endsWith('.') ? '' : '.'}`,
-          score: overlap + numericBonus + lengthBonus,
-        };
-      })
-      .sort((a, b) => b.score - a.score)
-      .map((item) => item.sentence)
-      .filter((sentence, index, arr) => arr.indexOf(sentence) === index)
-      .slice(0, 3);
-
-    const primary = evidenceLines[0] || fallback;
-    const secondary = evidenceLines[1] || 'The retrieved context supports the same conclusion in another section of the document.';
-    const tertiary = evidenceLines[2] || secondary;
-    const sourceLabel = retrievalMode === 'semantic'
-      ? 'Semantic retrieval match from your document.'
-      : 'Keyword retrieval match from your document.';
+    // Format with proper line breaks - each bullet on its own line
+    const bullets = selectedLines
+      .map(s => `• ${s}`)
+      .join('\n');
 
     if (explainMode === 'simple') {
-      return `**Answer**\n\n${primary}\n\n_${sourceLabel}_`;
+      return `**Answer**\n\n${bullets}`;
     }
 
     if (explainMode === 'exam') {
-      return `**Direct Answer**\n\n${primary}\n\n**Study Points**\n\n- ${secondary}\n- ${tertiary}\n\n_${sourceLabel}_`;
+      return `**Key Points**\n\n${bullets}`;
     }
 
-    return `**Answer**\n\n${primary}\n\n**Supporting Points**\n\n- ${secondary}\n- ${tertiary}\n\n_${sourceLabel}_`;
-
-    const bullets = retrievedContext
-      .split(/\n\n/)
-      .slice(0, 2)
-      .map((chunk) => {
-        const cleaned = chunk.replace(/^\[\d+\]\s*/, '').trim();
-        const firstSentence = cleaned.split(/[.!?]+/).find((sentence) => sentence.trim().length > 30)?.trim() || cleaned;
-        return firstSentence.slice(0, 160).trim();
-      })
-      .filter(Boolean)
-      .map((chunk) => `• ${chunk}${chunk.endsWith('.') ? '' : '.'}`)
-      .join('\n');
-
-    return fallback;
+    return `**Answer**\n\n${bullets}`;
   }, [currentDocument?.text, documentAnalysis, explainMode, pdfName]);
 
   // -------------------------------------------------------------------------
@@ -888,6 +1121,7 @@ REFERENCES
 
   const pushAssistantMessage = (content: string, cached = false, sources?: string[]) => {
     const msgId = addMessage('assistant', content, cached, sources);
+    setAnimatingMessageId(msgId); // Start typing animation for this message
     setStatusMessage('');
     setAppState('ready');
     return msgId;
@@ -931,11 +1165,10 @@ Answer:`;
 
       if (!silent) {
         cancelRef.current = cancel;
-        setAppState('streaming');
-        setStatusMessage('Refining answer...');
+        setAppState('thinking');
+        setStatusMessage('Generating final answer...');
       }
 
-      const msgId = !silent ? (targetMsgId || addMessage('assistant', '')) : undefined;
       let accumulated = '';
       let generatedText = '';
       let tokenCount = 0;
@@ -944,10 +1177,6 @@ Answer:`;
         accumulated += token;
         generatedText += token;
         tokenCount++;
-
-        if (!silent && msgId) {
-          updateMessage(msgId, buildStructuredAnswer(query, accumulated, context), true);
-        }
 
         const bulletCount = generatedText
           .split('\n')
@@ -960,10 +1189,15 @@ Answer:`;
         }
       }
 
-      const finalResponse = accumulated.trim() || buildStructuredAnswer(query, context);
+      const finalResponse = normalizeAnswerText(accumulated) || chooseDisplayAnswer(query, context);
+      const formattedFinal = chooseDisplayAnswer(query, finalResponse, context);
 
-      if (!silent && msgId) {
-        updateMessage(msgId, buildStructuredAnswer(query, finalResponse, context), false);
+      if (!silent) {
+        if (targetMsgId) {
+          updateMessage(targetMsgId, formattedFinal, false);
+        } else {
+          addMessage('assistant', formattedFinal);
+        }
         cancelRef.current = null;
         setStatusMessage('');
         setAppState('ready');
@@ -981,6 +1215,12 @@ Answer:`;
   };
 
   const refineRealDocumentResponse = useCallback(async (query: string, context: string, msgId: string) => {
+    // Only trigger LLM for complex queries (why, how, analyze, compare)
+    if (!OutputTransformer.shouldTriggerLLM(query)) {
+      console.log('[RAG] Skipping LLM refinement - simple query');
+      return;
+    }
+
     if (!currentDocument || llmState !== 'ready' || !context) {
       return;
     }
@@ -993,12 +1233,13 @@ Answer:`;
     refinementActiveRef.current.add(msgId);
 
     try {
+      // 3-second timeout for LLM refinement (as per requirements)
       const refined = await Promise.race<string>([
         generateWithLLM(query, context, { silent: true }),
-        new Promise<string>((_, reject) => setTimeout(() => reject(new Error('refinement-timeout')), 1900)),
+        new Promise<string>((_, reject) => setTimeout(() => reject(new Error('refinement-timeout')), 3000)),
       ]);
 
-      const normalized = buildStructuredAnswer(query, refined, context);
+      const normalized = chooseDisplayAnswer(query, refined, context);
       if (normalized.trim().length > 24) {
         updateMessage(msgId, normalized, false);
         await QueryCache.save(query, normalized, [context], {
@@ -1009,6 +1250,7 @@ Answer:`;
         });
       }
     } catch (error) {
+      // Discard silently on timeout (as per requirements)
       console.warn('[RAG] Silent refinement skipped:', error);
     } finally {
       refinementActiveRef.current.delete(msgId);
@@ -1038,7 +1280,7 @@ Answer:`;
           explainMode
         );
 
-        const demoAnswer = buildStructuredAnswer(query, instantResponse.text, currentDocument?.text?.slice(0, 240));
+        const demoAnswer = chooseDisplayAnswer(query, instantResponse.text, currentDocument?.text?.slice(0, 240));
         pushAssistantMessage(demoAnswer, true);
         await QueryCache.save(query, demoAnswer, [], {
           cacheType: 'demo',
@@ -1060,7 +1302,7 @@ Answer:`;
           intent: cacheIntent,
         });
         if (ragCached) {
-          pushAssistantMessage(buildStructuredAnswer(query, ragCached.response), true, ragCached.context);
+          pushAssistantMessage(chooseDisplayAnswer(query, ragCached.response, ...(ragCached.context || [])), true, ragCached.context);
           if (llmState === 'idle') {
             loadLLM().catch((error) => console.warn('[LLM] Background warmup failed:', error));
           }
@@ -1074,23 +1316,7 @@ Answer:`;
           intent: cacheIntent,
         });
         if (heuristicCached) {
-          pushAssistantMessage(buildStructuredAnswer(query, heuristicCached.response), true, heuristicCached.context);
-          if (llmState === 'idle') {
-            loadLLM().catch((error) => console.warn('[LLM] Background warmup failed:', error));
-          }
-          return;
-        }
-
-        const precomputed = DocumentStore.getCommonAnswer(currentDocument.id, query);
-        if (precomputed) {
-          const structured = buildStructuredAnswer(query, precomputed);
-          pushAssistantMessage(structured, true);
-          await QueryCache.save(query, structured, [], {
-            cacheType: 'heuristic',
-            mode: explainMode,
-            documentId: currentDocument.id,
-            intent: cacheIntent,
-          });
+          pushAssistantMessage(chooseDisplayAnswer(query, heuristicCached.response, ...(heuristicCached.context || [])), true, heuristicCached.context);
           if (llmState === 'idle') {
             loadLLM().catch((error) => console.warn('[LLM] Background warmup failed:', error));
           }
@@ -1133,15 +1359,15 @@ Answer:`;
       let fallbackText: string;
 
       if (currentDocument && !isDemoDocument) {
-        fallbackText = buildStructuredAnswer(
+        fallbackText = chooseDisplayAnswer(
           query,
           generateTextExtractionFallback(currentDocument.text, query, pdfName || 'Document'),
           documentAnalysis ? DocumentAnalyzer.generateResponse(documentAnalysis, query, pdfName || 'Document') : '',
         );
       } else if (currentDocument) {
-        fallbackText = buildStructuredAnswer(query, currentDocument.text.slice(0, 240));
+        fallbackText = chooseDisplayAnswer(query, currentDocument.text.slice(0, 240));
       } else {
-        fallbackText = buildStructuredAnswer(query, getIntelligentResponse(query));
+        fallbackText = chooseDisplayAnswer(query, getIntelligentResponse(query));
       }
 
       pushAssistantMessage(fallbackText, true);
@@ -1158,92 +1384,35 @@ Answer:`;
    * - Bullet point insights (3-5)
    */
   const generateTextExtractionFallback = (text: string, query: string, _documentName: string): string => {
-    const normalizedQuery = query.toLowerCase();
-
-    // Extract relevant sentences based on query keywords
-    const queryWords = normalizedQuery
-      .split(/\s+/)
-      .filter(w => w.length > 3);
-
+    // Extract sentences from text
     const sentences = text
       .split(/(?:[.!?]+(?:\s+|$))|(?:\n+)/)
       .map(s => s.trim())
       .filter(s => s.length >= 15 && s.length < 600);
 
-    // Score sentences by keyword match
-    const scoredSentences = sentences.map(sentence => {
-      const lowerSentence = sentence.toLowerCase();
-      let score = 0;
-      for (const word of queryWords) {
-        if (lowerSentence.includes(word)) {
-          score += 2;
-        }
-      }
-      // Boost sentences with signal words
-      const signals = ['important', 'key', 'main', 'result', 'finding', 'conclude', 'demonstrate'];
-      if (signals.some(s => lowerSentence.includes(s))) {
-        score += 1;
-      }
-      return { sentence, score };
-    });
-
-    // Get top 4 relevant sentences
-    const topSentences = scoredSentences
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 4)
-      .map(s => s.sentence);
-
-    // Remove duplicates based on first 5 words
-    const uniqueSentences: string[] = [];
-    const seen = new Set<string>();
-    for (const s of topSentences) {
-      const key = s.toLowerCase().split(/\s+/).slice(0, 5).join(' ');
-      if (!seen.has(key)) {
-        seen.add(key);
-        uniqueSentences.push(s);
-      }
-    }
-
-    // Format as bullet points (consistent with PerceptionEngine/DocumentAnalyzer)
-    if (uniqueSentences.length > 0) {
-      const bullets = uniqueSentences
-        .slice(0, 3)
-        .map(s => {
-          const words = s.split(/\s+/);
-          const shortened = words.length > 25 ? words.slice(0, 25).join(' ') + '...' : s;
-          const formatted = shortened.charAt(0).toUpperCase() + shortened.slice(1);
-          return formatted.endsWith('.') ? formatted : formatted + '.';
-        })
-        .join('\n');
-
-      return buildStructuredAnswer(query, bullets);
-    }
-
-    // Ultimate fallback: structured excerpt as bullets
-    let excerptSentences = text
-      .split(/(?:[.!?]+(?:\s+|$))|(?:\n+)/)
-      .map(s => s.trim())
-      .filter(s => s.length >= 15 && s.length < 300);
-
-    // Emergency split if document is one massive unbroken string without punctuation/newlines
-    if (excerptSentences.length === 0) {
+    if (sentences.length === 0) {
+      // Emergency split for massive unbroken text
       const words = text.split(/\s+/);
-      excerptSentences = [
-        words.slice(0, 15).join(' '),
-        words.slice(15, 30).join(' '),
-        words.slice(30, 45).join(' ')
-      ].filter(s => s.length > 5);
+      const emergencySentences = [
+        words.slice(0, 20).join(' '),
+        words.slice(20, 40).join(' '),
+        words.slice(40, 60).join(' ')
+      ].filter(s => s.length > 10);
+
+      if (emergencySentences.length === 0) {
+        return '**Key Insights**\n\nBased on the document:\n\n• No readable insights could be extracted from this document.';
+      }
+
+      // Let RAG decide how many insights to return
+      return OutputTransformer.transformOutput(emergencySentences, query, {
+        title: 'Key Insights'
+      });
     }
 
-    const fallbackBullets = excerptSentences
-      .slice(0, 3)
-      .map(s => {
-        const formatted = s.charAt(0).toUpperCase() + s.slice(1);
-        return formatted.endsWith('.') ? formatted : formatted + '.';
-      })
-      .join('\n');
-
-    return `**Key Insights**\n\nBased on the document, here are the key insights:\n\n${fallbackBullets || '• No readable insights could be extracted from this sparse document.'}`;
+    // Let RAG decide how many insights to return based on content quality
+    return OutputTransformer.transformOutput(sentences, query, {
+      title: 'Key Insights'
+    });
   };
 
   /**
@@ -1462,11 +1631,17 @@ Answer:`;
 
         <div style={styles.welcomeShell}>
           <div style={styles.welcomeHero}>
-            <div style={styles.welcomeEyebrow}>Premium Offline AI Research Copilot</div>
-            <h1 style={styles.welcomeTitle}>Your documents. Your device. Zero cloud dependency.</h1>
+            <div style={styles.welcomeEyebrow}>Offline AI Research Assistant</div>
+            <h1 style={styles.welcomeTitle}>
+              <span style={{ display: 'block' }}>Your documents.</span>
+              <span style={{ display: 'block' }}>Your device.</span>
+              <span style={{ display: 'block', color: '#8cd3bc' }}>Zero cloud dependency.</span>
+            </h1>
             <p style={styles.welcomeCopy}>
-              Enterprise-grade document intelligence that runs entirely on your machine. Upload any PDF, get instant answers powered by local AI.
-              No data leaves your device — complete privacy guaranteed.
+              Enterprise-grade document intelligence that runs entirely on your machine.
+            </p>
+            <p style={{ ...styles.welcomeCopy, marginTop: -16 }}>
+              Upload any PDF, get instant answers powered by local AI. No data leaves your device.
             </p>
 
             <div style={styles.welcomeActions}>
@@ -1762,7 +1937,7 @@ Answer:`;
                 </div>
 
                 <h3 style={styles.dropzoneTitle}>Drop a document into the workspace</h3>
-                <p style={styles.dropzoneSubtitle}>Upload once, then get grounded local answers with premium-speed retrieval.</p>
+                <p style={styles.dropzoneSubtitle}>Upload once, then get instant local answers with fast retrieval.</p>
 
                 <div style={styles.features}>
                   <span>⚡ Instant analysis</span>
@@ -1784,7 +1959,7 @@ Answer:`;
               {showGuide && (
                 <div style={styles.guide}>
                   <div style={styles.guideHeader}>
-                    <span>Premium Flow</span>
+                    <span>Quick Start</span>
                     <button onClick={() => setShowGuide(false)} style={styles.guideClose}>×</button>
                   </div>
                   <div style={styles.guideSteps}>
@@ -1850,9 +2025,15 @@ Answer:`;
             {messages.length === 0 ? (
               <div style={styles.emptyState}>
                 <div style={styles.emptyIcon}>📚</div>
-                <h2 style={styles.emptyTitle}>Grounded local document intelligence</h2>
+                <h2 style={styles.emptyTitle}>
+                  <span style={{ display: 'block' }}>Grounded Local</span>
+                  <span style={{ display: 'block' }}>Document Intelligence</span>
+                </h2>
                 <p style={styles.emptyDesc}>
-                  Upload a PDF and ask normally. Responses are grounded from retrieved sections of your document, with the local model warming quietly in the background.
+                  Upload a PDF and ask normally.
+                </p>
+                <p style={{ ...styles.emptyDesc, marginTop: -8, opacity: 0.7 }}>
+                  Responses are grounded from your document, with the local model running in background.
                 </p>
 
                 {currentDocument && (
@@ -1901,7 +2082,15 @@ Answer:`;
                       ...(msg.role === 'user' ? styles.messageContentUser : {})
                     }}>
                       {msg.role === 'assistant' && msg.content ? (
-                        <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+                        animatingMessageId === msg.id ? (
+                          <TypewriterText 
+                            content={msg.content} 
+                            speed={8}
+                            onComplete={() => setAnimatingMessageId(null)}
+                          />
+                        ) : (
+                          <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+                        )
                       ) : (
                         msg.content || '...'
                       )}
@@ -2240,11 +2429,11 @@ const styles: Record<string, React.CSSProperties> = {
   },
   welcomeTitle: {
     fontFamily: '"Instrument Serif", Georgia, serif',
-    fontSize: 'clamp(3rem, 6vw, 5.4rem)',
-    lineHeight: 0.94,
-    letterSpacing: '-0.05em',
+    fontSize: 'clamp(2.5rem, 5vw, 4.5rem)',
+    lineHeight: 1.1,
+    letterSpacing: '-0.03em',
     color: '#fff7eb',
-    marginBottom: 18,
+    marginBottom: 24,
     fontWeight: 400,
     maxWidth: 760,
   },
@@ -2785,8 +2974,8 @@ const styles: Record<string, React.CSSProperties> = {
     margin: '0 auto',
   },
   emptyIcon: { fontSize: 64, marginBottom: 20, opacity: 0.6 },
-  emptyTitle: { fontSize: 34, fontWeight: 500, margin: '0 0 12px', color: '#fff7eb', fontFamily: '"Instrument Serif", Georgia, serif' },
-  emptyDesc: { fontSize: 15, color: 'rgba(244,239,230,0.55)', lineHeight: 1.7, margin: '0 0 36px', fontWeight: 500 },
+  emptyTitle: { fontSize: 32, fontWeight: 500, margin: '0 0 16px', color: '#fff7eb', fontFamily: '"Instrument Serif", Georgia, serif', lineHeight: 1.2, textAlign: 'center' as const },
+  emptyDesc: { fontSize: 15, color: 'rgba(244,239,230,0.6)', lineHeight: 1.7, margin: '0 0 24px', fontWeight: 500, textAlign: 'center' as const },
   quickActions: { display: 'flex', flexDirection: 'column' as const, gap: 10 },
   quickLabel: { fontSize: 13, color: 'rgba(244,239,230,0.42)', margin: '0 0 10px', fontWeight: 500 },
   quickBtn: {
@@ -3136,31 +3325,61 @@ const globalCSS = `
     to { width: 0%; }
   }
 
-  /* Premium Markdown Content */
+  /* Enhanced Markdown Content */
   .md-content {
-    color: rgba(255,255,255,0.85);
+    color: rgba(255,255,255,0.88);
+    font-size: 15px;
+    line-height: 1.8;
   }
 
-  .md-content h1, .md-content h2, .md-content h3 {
-    background: linear-gradient(135deg, #fff 0%, #c4b5fd 100%);
+  .md-content .md-title {
+    display: block;
+    background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
-    margin: 16px 0 10px;
+    margin: 0 0 14px 0;
+    padding-bottom: 8px;
     font-weight: 700;
+    letter-spacing: -0.02em;
+    border-bottom: 1px solid rgba(102,126,234,0.25);
   }
-  .md-content h1 { font-size: 20px; }
-  .md-content h2 { font-size: 18px; }
-  .md-content h3 { font-size: 16px; }
-  .md-content p { margin: 10px 0; line-height: 1.7; }
-  .md-content ul { margin: 10px 0; padding-left: 24px; }
+
+  .md-content h1.md-title { font-size: 22px; }
+  .md-content h2.md-title { font-size: 20px; }
+  .md-content h3.md-title { font-size: 17px; }
+  
+  .md-content .md-para {
+    display: block;
+    margin: 10px 0;
+    line-height: 1.75; 
+    color: rgba(255,255,255,0.8);
+  }
+  
+  .md-content .md-list { 
+    display: block;
+    margin: 16px 0; 
+    padding-left: 0;
+    list-style: none;
+  }
   .md-content li {
-    margin: 6px 0;
-    color: rgba(255,255,255,0.75);
-    line-height: 1.6;
+    display: block;
+    margin: 14px 0;
+    color: rgba(255,255,255,0.88);
+    line-height: 1.75;
+    padding-left: 24px;
+    position: relative;
+    font-size: 15px;
   }
-  .md-content li::marker {
-    color: #667eea;
+  .md-content li::before {
+    content: "•";
+    position: absolute;
+    left: 0;
+    color: #818cf8;
+    font-weight: bold;
+    font-size: 18px;
+    line-height: 1.5;
   }
+  
   .md-content strong {
     color: #fff;
     font-weight: 600;
@@ -3185,7 +3404,24 @@ const globalCSS = `
     margin: 16px 0;
   }
 
-  /* Premium thinking dots */
+  /* Typewriter cursor animation */
+  .typewriter-container {
+    position: relative;
+  }
+  .typewriter-cursor {
+    display: inline-block;
+    color: #818cf8;
+    font-weight: 300;
+    font-size: 18px;
+    animation: blink 0.8s ease-in-out infinite;
+    margin-left: 2px;
+  }
+  @keyframes blink {
+    0%, 50% { opacity: 1; }
+    51%, 100% { opacity: 0; }
+  }
+
+  /* Enhanced thinking dots */
   .thinking-dots span {
     animation: bounce 1.4s infinite ease-in-out;
     background: linear-gradient(135deg, #667eea, #764ba2);

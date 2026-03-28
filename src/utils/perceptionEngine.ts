@@ -10,6 +10,7 @@
 import { QueryCache, detectCacheIntent } from './queryCache';
 import { getDemoResponse } from './demoHelpers';
 import { DocumentStore } from './documentStore';
+import { OutputTransformer } from './outputTransformer';
 
 // Use the shared STOP_WORDS set from documentStore to avoid duplication
 const STOP_WORDS = new Set([
@@ -456,13 +457,13 @@ class PerceptionEngineClass {
 
       // Try keyword search first (instant) - get more results for variety
       if (documentId) {
-        const results = DocumentStore.searchDocumentByKeyword(documentId, query, 3);
+        const results = DocumentStore.searchDocumentByKeyword(documentId, query, 5);
         allResults = results;
       }
 
       // Fallback to document text if no results
       if (allResults.length === 0 && documentText) {
-        const topText = this.extractTopSentences(documentText, query, 8);
+        const topText = this.extractTopSentences(documentText, query, 10);
         if (topText) {
           allResults = topText.split(/[.!?]+/).map(s => ({
             snippet: s.trim(),
@@ -473,47 +474,33 @@ class PerceptionEngineClass {
 
       if (allResults.length === 0) return null;
 
-      // Select diverse chunks: take high-scoring ones but vary selection
-      // This ensures different queries get different content even with same intent
-      const selected: string[] = [];
-      const seen = new Set<string>();
+      // Use OutputTransformer for quality filtering and transformation
+      const rawSentences = allResults.map(r => r.snippet);
+      const insights = OutputTransformer.transformToInsights(rawSentences, query, 3);
 
-      // Always include top result
-      if (allResults[0]) {
-        selected.push(allResults[0].snippet);
-        seen.add(allResults[0].snippet.toLowerCase().split(/\s+/).slice(0, 5).join(' '));
-      }
+      if (insights.length === 0) {
+        // Fallback: try with less strict filtering
+        const selected: string[] = [];
+        const seen = new Set<string>();
 
-      // For remaining slots, pick from rest of results
-      const remaining = allResults.slice(1).filter(r => r.score > 0);
-      if (remaining.length > 0) {
-        // Add more varied results
-        for (let i = 0; i < Math.min(2, remaining.length); i++) {
-          const idx = i < remaining.length ? i : Math.floor(Math.random() * remaining.length);
-          const r = remaining[idx];
-          if (r) {
-            const key = r.snippet.toLowerCase().split(/\s+/).slice(0, 5).join(' ');
-            if (!seen.has(key)) {
-              seen.add(key);
-              selected.push(r.snippet);
-            }
+        for (const r of allResults) {
+          if (!r.snippet.trim()) continue;
+          const cleaned = OutputTransformer.cleanSentence(r.snippet);
+          if (cleaned.length < 30) continue;
+
+          const key = cleaned.toLowerCase().split(/\s+/).slice(0, 5).join(' ');
+          if (!seen.has(key)) {
+            seen.add(key);
+            selected.push(OutputTransformer.rewriteSentence(cleaned));
           }
+          if (selected.length >= 3) break;
         }
+
+        if (selected.length === 0) return null;
+        return OutputTransformer.formatStructuredResponse(selected, 'Key Insights');
       }
 
-      // Format as bullet points
-      const bullets: string[] = [];
-      for (const s of selected) {
-        if (!s.trim()) continue;
-        const words = s.split(/\s+/);
-        let shortened = words.length > 25 ? words.slice(0, 25).join(' ') + '...' : s;
-        shortened = shortened.charAt(0).toUpperCase() + shortened.slice(1);
-        if (!shortened.match(/[.!?]$/)) shortened += '.';
-        bullets.push(`• ${shortened}`);
-      }
-
-      if (bullets.length === 0) return null;
-      return `**Key Insights**\n\nBased on the document:\n\n${bullets.join('\n')}`;
+      return OutputTransformer.formatStructuredResponse(insights, 'Key Insights');
     } catch (err) {
       console.warn('[Perception] Excerpt extraction failed:', err);
       return null;

@@ -3,7 +3,7 @@
  * Separates demo, RAG, and heuristic responses to avoid cross-mode collisions.
  */
 
-const STORAGE_KEY = 'research-copilot-query-cache-rag-v8';
+const STORAGE_KEY = 'research-copilot-query-cache-rag-v9';
 
 export type QueryCacheType = 'demo' | 'rag' | 'heuristic';
 export type QueryCacheIntent = 'summary' | 'key_points' | 'process' | 'benefits' | 'general';
