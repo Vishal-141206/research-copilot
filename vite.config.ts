@@ -82,6 +82,10 @@ function suppressRunanywhereSourcemaps(): Plugin {
 
 export default defineConfig({
   plugins: [react(), suppressRunanywhereSourcemaps(), copyWasmPlugin()],
+  resolve: {
+    // Ensure only ONE React instance across all dependencies
+    dedupe: ['react', 'react-dom'],
+  },
   server: {
     headers: {
       // Cross-Origin Isolation — required for SharedArrayBuffer / multi-threaded WASM.

@@ -25,6 +25,8 @@ export interface DocumentAnalysis {
   themes: ThemeGroup[];
   // NEW: Labeled sections for structured output
   labeledContent: LabeledContent;
+  // NEW: All sentences for query-specific search
+  allSentences: string[];
 }
 
 export interface ThemeGroup {
@@ -188,11 +190,11 @@ function removeFillerWords(sentence: string): string {
 /**
  * NEW: Rewrite sentence for bullet-friendly format
  * - Removes filler words
- * - Shortens length
+ * - Shortens length (but preserves more content)
  * - Converts to active voice where possible
  * - Avoids direct copy
  */
-function rewriteForBullet(sentence: string, maxWords: number = 20): string {
+function rewriteForBullet(sentence: string, maxWords: number = 30): string {
   // Step 1: Remove filler
   let rewritten = removeFillerWords(sentence);
 
@@ -202,7 +204,7 @@ function rewriteForBullet(sentence: string, maxWords: number = 20): string {
   // Step 3: Capitalize first letter
   rewritten = rewritten.charAt(0).toUpperCase() + rewritten.slice(1);
 
-  // Step 4: Shorten if needed
+  // Step 4: Shorten if needed (increased from 20 to 30 words)
   const words = rewritten.split(/\s+/);
   if (words.length > maxWords) {
     // Find natural break point
@@ -211,9 +213,9 @@ function rewriteForBullet(sentence: string, maxWords: number = 20): string {
 
     for (const bp of breakPoints) {
       const idx = rewritten.indexOf(bp);
-      if (idx > 30) {
+      if (idx > 40) {
         const wordCount = rewritten.slice(0, idx).split(/\s+/).length;
-        if (wordCount >= 8 && wordCount <= maxWords) {
+        if (wordCount >= 12 && wordCount <= maxWords) {
           bestBreak = wordCount;
           break;
         }
@@ -403,8 +405,8 @@ class DocumentAnalyzerClass {
     // Stage 1: Basic stats (fast)
     const stats = this.computeStats(text);
 
-    // Stage 2: Extract sentences
-    const sentences = this.extractSentences(text);
+    // Stage 2: Extract ALL sentences (for query-specific search)
+    const allSentences = this.extractSentences(text);
 
     // Stage 3: Extract keywords with improved TF-IDF
     const keywords = this.extractKeywords(text);
@@ -413,7 +415,7 @@ class DocumentAnalyzerClass {
     const sections = this.identifySections(text);
 
     // Stage 5: Rank sentences with improved formula
-    const rankedSentences = this.rankSentencesImproved(sentences, keywords, sections);
+    const rankedSentences = this.rankSentencesImproved(allSentences, keywords, sections);
 
     // Stage 6: Remove duplicates
     const topSentences = removeDuplicates(rankedSentences);
@@ -440,7 +442,8 @@ class DocumentAnalyzerClass {
       isAnalyzed: true,
       documentId,
       themes,
-      labeledContent
+      labeledContent,
+      allSentences // Store ALL sentences for query-specific search
     };
   }
 
@@ -468,7 +471,7 @@ class DocumentAnalyzerClass {
       .split(/(?:[.!?]+(?:\s+|$))|(?:\n+)/)
       .map(s => s.trim())
       .filter(s => s.length >= 15 && s.length < 600)
-      .slice(0, 100);
+      .slice(0, 200); // Increased from 100 to 200 for better coverage
   }
 
   /**
@@ -793,6 +796,132 @@ class DocumentAnalyzerClass {
   }
 
   // ==========================================================================
+  // QUERY-AWARE SENTENCE SEARCH (NEW - For Personalized Responses)
+  // ==========================================================================
+
+  /**
+   * Find sentences most relevant to a specific query
+   * Searches ALL sentences, not just pre-selected top ones
+   * Uses multi-factor scoring for high relevance
+   */
+  private findQueryRelevantSentences(
+    analysis: DocumentAnalysis,
+    query: string,
+    maxResults: number = 4
+  ): string[] {
+    // Extract meaningful query words - keep important short words
+    const importantShortWords = new Set(['ai', 'ml', 'api', 'gpu', 'cpu', 'pdf', 'rag', 'llm', 'key', 'how', 'why', 'use', 'new', 'old', 'big', 'low', 'run', 'web', 'app']);
+
+    const queryWords = query.toLowerCase()
+      .split(/\s+/)
+      .filter(w => {
+        const clean = w.replace(/[^a-z]/g, '');
+        // Keep if: important short word, long enough, and not a stop word
+        return importantShortWords.has(clean) ||
+               (clean.length >= 3 && !STOP_WORDS.has(clean));
+      });
+
+    console.log(`[DocumentAnalyzer] Query words: [${queryWords.join(', ')}]`);
+
+    if (queryWords.length === 0) {
+      console.log(`[DocumentAnalyzer] No query words - using topSentences`);
+      return analysis.topSentences.slice(0, maxResults);
+    }
+
+    // Score ALL sentences based on query relevance
+    const scored = analysis.allSentences.map(sentence => {
+      const lower = sentence.toLowerCase();
+      const words = lower.split(/\s+/);
+
+      let score = 0;
+
+      // 1. EXACT WORD MATCH (highest weight)
+      for (const qw of queryWords) {
+        const cleanQw = qw.replace(/[^a-z]/g, '');
+        if (words.some(w => {
+          const cleanW = w.replace(/[^a-z]/g, '');
+          return cleanW === cleanQw;
+        })) {
+          score += 3;
+        }
+      }
+
+      // 2. PARTIAL/STEM MATCH (medium weight) - for words 4+ chars
+      for (const qw of queryWords) {
+        if (qw.length >= 4) {
+          const stem = qw.slice(0, Math.min(qw.length - 1, 5));
+          if (words.some(w => w.includes(stem))) {
+            score += 1.5;
+          }
+        }
+      }
+
+      // 3. PHRASE PROXIMITY BONUS (words near each other)
+      if (queryWords.length >= 2) {
+        for (let i = 0; i < queryWords.length - 1; i++) {
+          const w1 = queryWords[i];
+          const w2 = queryWords[i + 1];
+          if (lower.includes(w1) && lower.includes(w2)) {
+            const idx1 = lower.indexOf(w1);
+            const idx2 = lower.indexOf(w2);
+            if (Math.abs(idx2 - idx1) < 50) {
+              score += 2; // Words are close together
+            }
+          }
+        }
+      }
+
+      // 4. KEYWORD OVERLAP BONUS (document keywords in sentence)
+      const keywordOverlap = analysis.keywords.filter(kw => lower.includes(kw)).length;
+      score += keywordOverlap * 0.3;
+
+      // 5. SENTENCE QUALITY (prefer medium-length informative sentences)
+      if (sentence.length >= 40 && sentence.length <= 300) {
+        score += 0.5;
+      }
+      if (this.hasSignalWords(sentence)) {
+        score += 0.5;
+      }
+
+      return { sentence, score };
+    });
+
+    // Sort by score and return top results
+    const results = scored
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxResults)
+      .map(s => s.sentence);
+
+    console.log(`[DocumentAnalyzer] Found ${results.length} relevant sentences (top scores: ${scored.filter(s => s.score > 0).slice(0, 3).map(s => s.score.toFixed(1)).join(', ')})`);
+
+    return results;
+  }
+
+  /**
+   * Generate title based on query intent
+   */
+  private generateQueryTitle(query: string): string {
+    const lower = query.toLowerCase();
+
+    if (lower.includes('what')) return 'Answer';
+    if (lower.includes('how')) return 'Process';
+    if (lower.includes('why')) return 'Reasoning';
+    if (lower.includes('when')) return 'Timeline';
+    if (lower.includes('where')) return 'Location';
+    if (lower.includes('who')) return 'Participants';
+    if (lower.includes('explain')) return 'Explanation';
+    if (lower.includes('compare')) return 'Comparison';
+    if (lower.includes('differ')) return 'Differences';
+    if (lower.includes('advantage') || lower.includes('benefit')) return 'Benefits';
+    if (lower.includes('disadvantage') || lower.includes('drawback')) return 'Limitations';
+    if (lower.includes('example')) return 'Examples';
+    if (lower.includes('define') || lower.includes('meaning')) return 'Definition';
+
+    return 'Key Insights';
+  }
+
+  // ==========================================================================
   // AI-LIKE RESPONSE GENERATION (INTENT-AWARE)
   // ==========================================================================
 
@@ -819,18 +948,22 @@ class DocumentAnalyzerClass {
     const { intent, format } = this.detectQueryIntent(query);
     const normalizedQuery = query.toLowerCase();
 
-    // Route to appropriate formatter based on intent
+    // DEBUG: Log query analysis
+    console.log(`[DocumentAnalyzer] Query: "${query}"`);
+    console.log(`[DocumentAnalyzer] Intent: ${intent}, AllSentences: ${analysis.allSentences.length}`);
+
+    // Route to appropriate formatter based on intent (now query-aware)
     switch (intent) {
       case 'how':
-        return this.formatHowResponse(analysis, documentName);
+        return this.formatHowResponse(analysis, query, documentName);
       case 'why':
-        return this.formatWhyResponse(analysis, documentName);
+        return this.formatWhyResponse(analysis, query, documentName);
       case 'benefits':
-        return this.formatBenefitsResponse(analysis, documentName);
+        return this.formatBenefitsResponse(analysis, query, documentName);
       case 'results':
-        return this.formatResultsResponse(analysis, documentName);
+        return this.formatResultsResponse(analysis, query, documentName);
       case 'summary':
-        return this.formatSummaryResponse(analysis, documentName);
+        return this.formatSummaryResponse(analysis, query, documentName);
       default:
         // Fall through to legacy detection for backwards compatibility
         break;
@@ -838,19 +971,19 @@ class DocumentAnalyzerClass {
 
     // Legacy detection for broader compatibility
     if (normalizedQuery.includes('summar') || normalizedQuery.includes('overview') || normalizedQuery.includes('about')) {
-      return this.formatSummaryResponse(analysis, documentName);
+      return this.formatSummaryResponse(analysis, query, documentName);
     }
 
     if (normalizedQuery.includes('key') || normalizedQuery.includes('main') || normalizedQuery.includes('important') || normalizedQuery.includes('point')) {
-      return this.formatKeyPointsResponse(analysis, documentName);
+      return this.formatKeyPointsResponse(analysis, query, documentName);
     }
 
     if (normalizedQuery.includes('method') || normalizedQuery.includes('approach') || normalizedQuery.includes('process')) {
-      return this.formatMethodologyResponse(analysis, documentName);
+      return this.formatMethodologyResponse(analysis, query, documentName);
     }
 
     if (normalizedQuery.includes('finding') || normalizedQuery.includes('conclude') || normalizedQuery.includes('outcome')) {
-      return this.formatResultsResponse(analysis, documentName);
+      return this.formatResultsResponse(analysis, query, documentName);
     }
 
     if (normalizedQuery.includes('explain') || normalizedQuery.includes('what is') || normalizedQuery.includes('describe')) {
@@ -863,15 +996,26 @@ class DocumentAnalyzerClass {
   /**
    * NEW: Format response for "how" queries - process steps format
    */
-  private formatHowResponse(analysis: DocumentAnalysis, _documentName: string): string {
-    const methodSentences = analysis.labeledContent.methodology.length > 0
+  private formatHowResponse(analysis: DocumentAnalysis, query: string, _documentName: string): string {
+    // First try labeled methodology
+    let methodSentences = analysis.labeledContent.methodology.length > 0
       ? analysis.labeledContent.methodology
-      : analysis.topSentences.filter(s =>
-          /method|approach|process|technique|use|step|first|then/i.test(s)
-        ).slice(0, 4);
+      : [];
+
+    // If not found, search ALL sentences using the actual user query
+    if (methodSentences.length === 0) {
+      methodSentences = this.findQueryRelevantSentences(analysis, query, 4);
+    }
+
+    // Last resort: filter for process keywords
+    if (methodSentences.length === 0) {
+      methodSentences = analysis.allSentences.filter(s =>
+        /method|approach|process|technique|use|step|first|then/i.test(s)
+      ).slice(0, 4);
+    }
 
     if (methodSentences.length === 0) {
-      return this.formatDefaultResponse(analysis, 'how', _documentName);
+      return this.formatDefaultResponse(analysis, query, _documentName);
     }
 
     // Add reasoning connectors for process flow
@@ -887,10 +1031,16 @@ class DocumentAnalyzerClass {
   /**
    * NEW: Format response for "why" queries - reasoning format
    */
-  private formatWhyResponse(analysis: DocumentAnalysis, _documentName: string): string {
-    const reasoningSentences = analysis.topSentences.filter(s =>
-      /because|since|due to|reason|purpose|therefore|thus|aim|goal/i.test(s)
-    ).slice(0, 3);
+  private formatWhyResponse(analysis: DocumentAnalysis, query: string, _documentName: string): string {
+    // Search ALL sentences using the actual user query
+    let reasoningSentences = this.findQueryRelevantSentences(analysis, query, 4);
+
+    // Fallback to pattern matching if query search finds nothing
+    if (reasoningSentences.length === 0) {
+      reasoningSentences = analysis.allSentences.filter(s =>
+        /because|since|due to|reason|purpose|therefore|thus|aim|goal/i.test(s)
+      ).slice(0, 3);
+    }
 
     if (reasoningSentences.length === 0) {
       // Construct reasoning from available content
@@ -916,16 +1066,21 @@ class DocumentAnalyzerClass {
   /**
    * NEW: Format response for "benefits" queries - advantages list
    */
-  private formatBenefitsResponse(analysis: DocumentAnalysis, _documentName: string): string {
-    // Find benefit-themed content
-    const benefitTheme = analysis.themes.find(t => t.label === 'Benefits');
-    const benefitSentences = benefitTheme?.sentences ||
-      analysis.topSentences.filter(s =>
-        /benefit|advantage|improve|enhance|better|efficient|enable|allow|positive/i.test(s)
-      ).slice(0, 4);
+  private formatBenefitsResponse(analysis: DocumentAnalysis, query: string, _documentName: string): string {
+    // Find benefit-themed content using actual user query
+    let benefitSentences = this.findQueryRelevantSentences(analysis, query, 4);
+
+    // Fallback to theme-based or pattern matching
+    if (benefitSentences.length === 0) {
+      const benefitTheme = analysis.themes.find(t => t.label === 'Benefits');
+      benefitSentences = benefitTheme?.sentences ||
+        analysis.allSentences.filter(s =>
+          /benefit|advantage|improve|enhance|better|efficient|enable|allow|positive/i.test(s)
+        ).slice(0, 4);
+    }
 
     if (benefitSentences.length === 0) {
-      return this.formatDefaultResponse(analysis, 'benefits', _documentName);
+      return this.formatDefaultResponse(analysis, query, _documentName);
     }
 
     const bullets = benefitSentences.map(s => `• ${rewriteForBullet(s)}`).join('\n');
@@ -933,7 +1088,7 @@ class DocumentAnalyzerClass {
     return `**Key Benefits**\n\nBased on the document:\n\n${bullets}`;
   }
 
-  private formatSummaryResponse(analysis: DocumentAnalysis, _documentName: string): string {
+  private formatSummaryResponse(analysis: DocumentAnalysis, query: string, _documentName: string): string {
     const opener = 'Based on the document:';
 
     // Use labeled summary if available
@@ -948,20 +1103,26 @@ class DocumentAnalyzerClass {
     return `**Summary**\n\n${opener}\n\n${bullets}`;
   }
 
-  private formatKeyPointsResponse(analysis: DocumentAnalysis, _documentName: string): string {
+  private formatKeyPointsResponse(analysis: DocumentAnalysis, query: string, _documentName: string): string {
     const opener = 'Based on the document:';
-    const uniquePoints = removeDuplicates(analysis.keyPoints);
 
-    const bullets = uniquePoints.length > 0
-      ? toBulletPoints(uniquePoints.slice(0, 4), 4, true)
-      : analysis.topSentences.length > 0
-        ? toBulletPoints(analysis.topSentences.slice(0, 4), 4, true)
-        : '• No explicit key points could be extracted from this sparse document.';
+    // Try to find query-specific key points first
+    let keyPointSentences = this.findQueryRelevantSentences(analysis, query, 4);
+
+    // Fallback to pre-computed key points
+    if (keyPointSentences.length === 0) {
+      const uniquePoints = removeDuplicates(analysis.keyPoints);
+      keyPointSentences = uniquePoints.length > 0 ? uniquePoints : analysis.topSentences.slice(0, 4);
+    }
+
+    const bullets = keyPointSentences.length > 0
+      ? toBulletPoints(keyPointSentences.slice(0, 4), 4, true)
+      : '• No explicit key points could be extracted from this sparse document.';
 
     return `**Key Points**\n\n${opener}\n\n${bullets}`;
   }
 
-  private formatMethodologyResponse(analysis: DocumentAnalysis, documentName: string): string {
+  private formatMethodologyResponse(analysis: DocumentAnalysis, query: string, documentName: string): string {
     const opener = 'Based on the document:';
 
     // Use labeled methodology if available
@@ -974,8 +1135,8 @@ class DocumentAnalyzerClass {
       return `**Methodology**\n\n${opener}\n\n${bullets}`;
     }
 
+    // Try section-based extraction
     const methodSection = analysis.sections.find(s => s.type === 'methodology');
-
     if (methodSection) {
       const methodPoints = methodSection.content
         .split(/[.!?]+/)
@@ -986,19 +1147,17 @@ class DocumentAnalyzerClass {
       return `**Methodology**\n\n${opener}\n\n${toBulletPoints(methodPoints, 4, true)}`;
     }
 
-    // Fallback to relevant sentences
-    const methodSentences = analysis.topSentences
-      .filter(s => /method|approach|process|technique|procedure|use|employ/i.test(s))
-      .slice(0, 3);
+    // Query-aware fallback: search using actual user query
+    const methodSentences = this.findQueryRelevantSentences(analysis, query, 4);
 
     if (methodSentences.length > 0) {
-      return `**Methodology**\n\n${opener}\n\n${toBulletPoints(methodSentences, 3, true)}`;
+      return `**Methodology**\n\n${opener}\n\n${toBulletPoints(methodSentences.map(s => rewriteForBullet(s)), 4, true)}`;
     }
 
-    return this.formatDefaultResponse(analysis, 'methodology', documentName);
+    return this.formatDefaultResponse(analysis, query, documentName);
   }
 
-  private formatResultsResponse(analysis: DocumentAnalysis, _documentName: string): string {
+  private formatResultsResponse(analysis: DocumentAnalysis, query: string, _documentName: string): string {
     const opener = 'Based on the document:';
 
     // Use labeled findings if available
@@ -1007,9 +1166,9 @@ class DocumentAnalyzerClass {
       return `**Key Findings**\n\n${opener}\n\n${enhanced.map(s => `• ${s}`).join('\n')}`;
     }
 
+    // Try section-based extraction
     const resultSection = analysis.sections.find(s => s.type === 'results');
     const conclusionSection = analysis.sections.find(s => s.type === 'conclusion');
-
     const section = resultSection || conclusionSection;
 
     if (section && section.content.length > 100) {
@@ -1022,47 +1181,64 @@ class DocumentAnalyzerClass {
       return `**Key Findings**\n\n${opener}\n\n${toBulletPoints(resultPoints, 4, true)}`;
     }
 
-    // Fallback to signal-word sentences
-    const resultSentences = analysis.topSentences
-      .filter(s => /result|finding|show|demonstrate|conclude|indicate|achieve/i.test(s))
-      .slice(0, 3);
+    // Query-aware fallback: search using actual user query
+    const resultSentences = this.findQueryRelevantSentences(analysis, query, 4);
 
-    return `**Key Findings**\n\n${opener}\n\n${toBulletPoints(resultSentences, 3, true)}`;
+    if (resultSentences.length > 0) {
+      const enhanced = addReasoningConnector(resultSentences.map(s => rewriteForBullet(s)));
+      return `**Key Findings**\n\n${opener}\n\n${enhanced.map(s => `• ${s}`).join('\n')}`;
+    }
+
+    return `**Key Findings**\n\n${opener}\n\n${toBulletPoints(analysis.topSentences.slice(0, 3), 3, true)}`;
   }
 
   private formatExplainResponse(analysis: DocumentAnalysis, query: string, documentName: string): string {
     const opener = 'Based on the document:';
 
-    // Find sentences most relevant to the query
-    const queryWords = query.toLowerCase()
-      .split(/\s+/)
-      .filter(w => w.length > 3 && !STOP_WORDS.has(w));
-
-    const relevantSentences = analysis.topSentences
-      .map(s => {
-        const score = queryWords.filter(w => s.toLowerCase().includes(w)).length;
-        return { sentence: s, score };
-      })
-      .filter(s => s.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 3)
-      .map(s => s.sentence);
+    // Use query-aware search to find MOST RELEVANT sentences
+    const relevantSentences = this.findQueryRelevantSentences(analysis, query, 4);
 
     if (relevantSentences.length > 0) {
-      // Add reasoning connectors for explanation flow
-      const enhanced = addReasoningConnector(relevantSentences.map(s => rewriteForBullet(s)));
-      return `**Explanation**\n\n${opener}\n\n${enhanced.map(s => `• ${s}`).join('\n')}`;
+      // Direct bullet points for clearer, more specific content
+      const bullets = relevantSentences
+        .map(s => `• ${rewriteForBullet(s)}`)
+        .join('\n');
+
+      return `**Explanation**\n\n${opener}\n\n${bullets}`;
     }
 
     return this.formatDefaultResponse(analysis, query, documentName);
   }
 
-  private formatDefaultResponse(analysis: DocumentAnalysis, _query: string, _documentName: string): string {
+  private formatDefaultResponse(analysis: DocumentAnalysis, query: string, _documentName: string): string {
     const opener = 'Based on the document:';
-    const uniqueSentences = removeDuplicates(analysis.topSentences);
 
+    // IMPROVED: Use query-aware search for personalized responses
+    const relevantSentences = this.findQueryRelevantSentences(analysis, query, 4);
+
+    console.log(`[DocumentAnalyzer] formatDefaultResponse - found ${relevantSentences.length} sentences for query: "${query}"`);
+
+    if (relevantSentences.length > 0) {
+      // Generate dynamic title based on query
+      const title = this.generateQueryTitle(query);
+
+      // Log first sentence to verify different content
+      console.log(`[DocumentAnalyzer] First sentence: "${relevantSentences[0].slice(0, 50)}..."`);
+
+      // Format as direct bullet points WITHOUT artificial connectors
+      // This preserves the actual document content better
+      const bullets = relevantSentences
+        .map(s => `• ${rewriteForBullet(s)}`)
+        .join('\n');
+
+      return `**${title}**\n\n${opener}\n\n${bullets}`;
+    }
+
+    // Fallback to pre-computed top sentences only if no query matches
+    console.log(`[DocumentAnalyzer] No matches - using topSentences fallback`);
+    const uniqueSentences = removeDuplicates(analysis.topSentences);
     const bullets = uniqueSentences.length > 0
-      ? toBulletPoints(uniqueSentences.slice(0, 3), 3, true)
+      ? uniqueSentences.slice(0, 3).map(s => `• ${rewriteForBullet(s)}`).join('\n')
       : '• This document appears to be very sparse or mostly visual.\n• Broad summaries are difficult to generate.';
 
     return `**Key Insights**\n\n${opener}\n\n${bullets}`;

@@ -5,9 +5,6 @@ import { pipeline, env } from '@xenova/transformers';
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-// Configure PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
-
 let embedder: any = null;
 
 async function getEmbedder() {
@@ -29,7 +26,7 @@ function chunkText(text: string, size = 500, overlap = 50): string[] {
 }
 
 self.onmessage = async (e: MessageEvent) => {
-  const { type, arrayBuffer, text } = e.data;
+  const { type, arrayBuffer, text, includeEmbeddings = false } = e.data;
   
   try {
     if (type === 'embed') {
@@ -43,7 +40,7 @@ self.onmessage = async (e: MessageEvent) => {
     }
 
     // Default to extraction
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer, disableWorker: true } as any).promise;
     let fullText = '';
     const numPages = pdf.numPages;
 
@@ -65,25 +62,26 @@ self.onmessage = async (e: MessageEvent) => {
     const chunks = chunkText(cleanText);
     const embeddings: number[][] = [];
 
-    // 2. Generate Embeddings
-    const generateEmbeddings = await getEmbedder();
-    
-    for (let i = 0; i < chunks.length; i++) {
-      self.postMessage({ 
-        type: 'progress', 
-        status: `Vectorizing: Chunk ${i + 1}/${chunks.length}`,
-        progress: 0.3 + (i / chunks.length) * 0.6 
-      });
+    if (includeEmbeddings) {
+      const generateEmbeddings = await getEmbedder();
 
-      const output = await generateEmbeddings(chunks[i], { pooling: 'mean', normalize: true });
-      embeddings.push(Array.from(output.data));
+      for (let i = 0; i < chunks.length; i++) {
+        self.postMessage({
+          type: 'progress',
+          status: `Vectorizing: Chunk ${i + 1}/${chunks.length}`,
+          progress: 0.3 + (i / chunks.length) * 0.6
+        });
+
+        const output = await generateEmbeddings(chunks[i], { pooling: 'mean', normalize: true });
+        embeddings.push(Array.from(output.data));
+      }
     }
 
     self.postMessage({ 
       type: 'done', 
       text: cleanText,
       chunks: chunks,
-      embeddings: embeddings,
+      embeddings: includeEmbeddings ? embeddings : undefined,
       pages: numPages
     });
 

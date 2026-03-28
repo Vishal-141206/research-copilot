@@ -1,6 +1,6 @@
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
-import { initSDK } from './runanywhere';
+import { primeSDK } from './runanywhere';
 import './styles/app.css';
 
 // Register Service Worker for offline capability
@@ -20,5 +20,5 @@ if ('serviceWorker' in navigator) {
 // (We don't use StrictMode as it causes double-initialization of the AI WASM singletons)
 createRoot(document.getElementById('root')!).render(<App />);
 
-// 3. Pre-initialize AI logic (WASM engine starts warming up immediately)
-initSDK().catch(e => console.error('Failed to init AI:', e));
+// 3. Prime only the lightweight SDK core after first paint.
+primeSDK();

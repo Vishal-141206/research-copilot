@@ -9,21 +9,21 @@
  * - Smart caching & persistence
  */
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ModelCategory, ModelManager, EventBus } from '@runanywhere/web';
-import { TextGeneration } from '@runanywhere/web-llamacpp';
-import { STT } from '@runanywhere/web-onnx';
 import { DocumentStore, Document as StoredDoc } from '../utils/documentStore';
-import { QueryCache } from '../utils/queryCache';
-import { getDemoResponse, createDemoPDFBlob, injectDemoCache } from '../utils/demoHelpers';
-import { PerceptionEngine, createTypingAnimation, getSkeletonHTML, InstantResponse } from '../utils/perceptionEngine';
+import { QueryCache, detectCacheIntent } from '../utils/queryCache';
+import { getDemoResponse, injectDemoCache } from '../utils/demoHelpers';
+import { PerceptionEngine } from '../utils/perceptionEngine';
 import { DocumentAnalyzer, DocumentAnalysis } from '../utils/documentAnalyzer';
-import { getAccelerationMode, isUsingWebGPU } from '../runanywhere';
-import * as pdfjsLib from 'pdfjs-dist';
-
-// Configure PDF.js
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+import {
+  ensureLLMRuntime,
+  getAccelerationMode,
+  getSTTApi,
+  getTextGenerationApi,
+  isUsingWebGPU,
+} from '../runanywhere';
 
 // ============================================================================
 // TYPES
@@ -32,6 +32,8 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dis
 type ExplainMode = 'simple' | 'detailed' | 'exam';
 type AppState = 'welcome' | 'loading' | 'processing' | 'ready' | 'thinking' | 'streaming';
 type ModelState = 'idle' | 'downloading' | 'loading' | 'ready' | 'error';
+type SemanticState = 'idle' | 'indexing' | 'ready';
+type QueryIntent = 'how' | 'why' | 'summary' | 'benefits' | 'results' | 'default';
 
 interface Message {
   id: string;
@@ -54,37 +56,14 @@ interface FloatingAction {
 // ============================================================================
 
 /**
- * DEBUG_MODE: Set to true to bypass RAG and test LLM speed directly.
- * If LLM is still slow with DEBUG_MODE=true, the issue is runtime/acceleration.
- */
-const DEBUG_MODE = false;
-
-/**
- * DEMO_SAFE_MODE: Controls background LLM refinement behavior.
- * When true:
- * - Disables slow background LLM refinement for ALL documents
- * - Pre-caches demo responses at startup
- * - Guarantees fast responses without LLM dependency
+ * DEMO_SAFE_MODE: When TRUE, bypasses LLM even when ready.
+ * Set to FALSE to use actual AI when model is loaded.
  *
- * IMPORTANT: This does NOT affect primary query routing!
- * - Demo documents -> PerceptionEngine (based on isDemoDocument flag)
- * - Real documents -> DocumentAnalyzer (ALWAYS, regardless of this flag)
- *
- * Set to TRUE before any live demo!
+ * Behavior:
+ * - TRUE: Always use instant heuristic responses (for hackathon demos)
+ * - FALSE: Use LLM when ready, instant response when not ready
  */
-const DEMO_SAFE_MODE = true;
-
-/**
- * LLM_TIMEOUT_MS: Maximum time to wait for LLM response before fallback.
- * AGGRESSIVE: 2 seconds max to ensure snappy UX.
- */
-const LLM_TIMEOUT_MS = 2000;
-
-/**
- * LLM_REFINEMENT_TIMEOUT_MS: Max time for background LLM refinement.
- * If exceeded, silently discard - don't update UI with stale response.
- */
-const LLM_REFINEMENT_TIMEOUT_MS = 3000;
+const DEMO_SAFE_MODE = false;
 
 // ============================================================================
 // DEMO RESPONSES (Fallback when models unavailable)
@@ -153,13 +132,6 @@ function getIntelligentResponse(query: string): string {
   return getDemoResponse(query) || DEMO_RESPONSES.default;
 }
 
-function* streamText(text: string, chunkSize = 3): Generator<string> {
-  const words = text.split(' ');
-  for (let i = 0; i < words.length; i += chunkSize) {
-    yield words.slice(i, i + chunkSize).join(' ') + ' ';
-  }
-}
-
 /** Simple markdown-to-HTML renderer for AI responses */
 function renderMarkdown(text: string): string {
   if (!text) return '';
@@ -226,6 +198,148 @@ function generateSmartSuggestions(text: string, filename: string): string[] {
   return suggestions.slice(0, 4);
 }
 
+function detectQueryIntent(query: string): QueryIntent {
+  const lower = query.toLowerCase();
+  if (/(how|steps?|process|method|approach|procedure)/.test(lower)) return 'how';
+  if (/(why|reason|because|purpose|goal)/.test(lower)) return 'why';
+  if (/(summary|summarize|overview|brief|tldr|about)/.test(lower)) return 'summary';
+  if (/(benefit|advantages?|pros|value|improve|gain)/.test(lower)) return 'benefits';
+  if (/(result|finding|outcome|conclusion|impact|evidence)/.test(lower)) return 'results';
+  return 'default';
+}
+
+function stripPresentationNoise(text: string): string {
+  return text
+    .replace(/\*\*/g, ' ')
+    .replace(/__/g, ' ')
+    .replace(/`/g, ' ')
+    .replace(/^#+\s*/gm, '')
+    .replace(/\[[0-9]+\]/g, ' ')
+    .replace(/[_*]{1,2}([^_*]+)[_*]{1,2}/g, '$1')
+    .replace(/\b(keyword|semantic) retrieval match from your document\.?/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractCandidatePoints(rawText: string): string[] {
+  if (!rawText) return [];
+
+  const normalized = rawText
+    .replace(/\r/g, '\n')
+    .replace(/â€¢/g, '-')
+    .replace(/•/g, '-');
+
+  const lineCandidates = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.replace(/^[-*]\s*/, '').replace(/^\d+\.\s*/, '').trim())
+    .filter((line) => line.length >= 12)
+    .filter((line) => !/^(based on the document|summary|overview|answer|direct answer|supporting points|study points|key insights|explanation|methodology|conclusion|results|reasoning)$/i.test(line));
+
+  const sentenceCandidates = stripPresentationNoise(normalized)
+    .split(/[.!?\n]+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length >= 18 && sentence.length <= 180);
+
+  return [...lineCandidates, ...sentenceCandidates];
+}
+
+function normalizePointText(text: string, maxWords: number): string {
+  const compact = stripPresentationNoise(text)
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .replace(/^(step|reason|benefit|advantage|finding|result|outcome|overview|focus|takeaway|detail|insight)\s*:\s*/i, '')
+    .replace(/\b(document|paper|research|study)\b/gi, (match) => match.toLowerCase())
+    .trim();
+
+  if (!compact) return '';
+
+  const words = compact.split(/\s+/).slice(0, maxWords);
+  const clipped = words.join(' ').replace(/[,:;.\s]+$/, '');
+  if (!clipped) return '';
+
+  return clipped.charAt(0).toUpperCase() + clipped.slice(1);
+}
+
+function getIntentPrefix(intent: QueryIntent, index: number): string {
+  const prefixMap: Record<QueryIntent, string[]> = {
+    how: ['Step 1:', 'Step 2:', 'Step 3:'],
+    why: ['Reason:', 'Because:', 'Impact:'],
+    summary: ['Overview:', 'Focus:', 'Takeaway:'],
+    benefits: ['Benefit:', 'Advantage:', 'Value:'],
+    results: ['Finding:', 'Result:', 'Outcome:'],
+    default: ['Insight:', 'Detail:', 'Takeaway:'],
+  };
+
+  return prefixMap[intent][Math.min(index, 2)];
+}
+
+function buildStructuredAnswer(query: string, ...sources: Array<string | null | undefined>): string {
+  const intent = detectQueryIntent(query);
+  const seen = new Set<string>();
+  const points: string[] = [];
+
+  for (const source of sources) {
+    for (const candidate of extractCandidatePoints(source || '')) {
+      const normalized = candidate.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      points.push(candidate);
+      if (points.length >= 5) break;
+    }
+    if (points.length >= 5) break;
+  }
+
+  const fallbackPoints: Record<QueryIntent, string[]> = {
+    how: [
+      'Step 1: Review the most relevant section',
+      'Step 2: Use the supporting evidence nearby',
+      'Step 3: Ask a narrower follow-up for detail',
+    ],
+    why: [
+      'Reason: The document highlights a clear objective',
+      'Because: Supporting evidence appears in the strongest match',
+      'Impact: A narrower follow-up will improve precision',
+    ],
+    summary: [
+      'Overview: The answer comes from the strongest matched section',
+      'Focus: Key evidence was extracted from the uploaded file',
+      'Takeaway: Ask a narrower follow-up for deeper detail',
+    ],
+    benefits: [
+      'Benefit: The response stays grounded in the document',
+      'Advantage: Relevant evidence is ranked before answering',
+      'Value: Follow-up questions can target a specific section',
+    ],
+    results: [
+      'Finding: The top-ranked section contains the strongest evidence',
+      'Result: The answer is limited to concise grounded points',
+      'Outcome: A narrower query can surface more specific findings',
+    ],
+    default: [
+      'Insight: The answer is grounded in the uploaded document',
+      'Detail: The strongest matching section was used first',
+      'Takeaway: Follow-up questions can narrow the evidence further',
+    ],
+  };
+
+  const finalPoints = (points.length ? points : fallbackPoints[intent])
+    .slice(0, 3)
+    .map((point, index) => {
+      const normalized = normalizePointText(point, intent === 'how' ? 12 : 10);
+      const fallback = fallbackPoints[intent][index];
+      const prefix = getIntentPrefix(intent, index);
+      if (!normalized) return fallback;
+      return `${prefix} ${normalized}`;
+    });
+
+  while (finalPoints.length < 3) {
+    finalPoints.push(fallbackPoints[intent][finalPoints.length]);
+  }
+
+  return `Based on the document:\n- ${finalPoints.join('\n- ')}`;
+}
+
 // ============================================================================
 // MAIN COMPONENT
 // ============================================================================
@@ -244,6 +358,8 @@ export function HackathonWinner() {
   const [llmState, setLlmState] = useState<ModelState>('idle');
   const [sttState, setSttState] = useState<ModelState>('idle');
   const [llmProgress, setLlmProgress] = useState(0);
+  const [semanticState, setSemanticState] = useState<SemanticState>('idle');
+  const [semanticProgress, setSemanticProgress] = useState(0);
 
   // Document state
   const [pdfText, setPdfText] = useState<string>('');
@@ -266,7 +382,6 @@ export function HackathonWinner() {
   const [isDragging, setIsDragging] = useState(false);
   const [floatingAction, setFloatingAction] = useState<FloatingAction | null>(null);
   const [isDemoDocument, setIsDemoDocument] = useState(false);  // Tracks if current doc is demo
-  const [demoMode, setDemoMode] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [showGuide, setShowGuide] = useState(true);
   const [guideStep, setGuideStep] = useState(0);
@@ -280,8 +395,22 @@ export function HackathonWinner() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<(() => void) | null>(null);
   const voiceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const typingCancelRef = useRef<(() => void) | null>(null);
   const refinementActiveRef = useRef<Set<string>>(new Set());
+  const documentPreview = useMemo(() => {
+    if (!pdfText) {
+      return { paragraphs: [] as string[], hiddenCount: 0 };
+    }
+
+    const paragraphs = pdfText
+      .split('\n\n')
+      .map((paragraph) => paragraph.trim())
+      .filter(Boolean);
+
+    return {
+      paragraphs: paragraphs.slice(0, 24),
+      hiddenCount: Math.max(0, paragraphs.length - 24),
+    };
+  }, [pdfText]);
 
   // -------------------------------------------------------------------------
   // INITIALIZATION
@@ -331,7 +460,7 @@ export function HackathonWinner() {
         setLlmState('ready');
       }
 
-      setProgress(0.8);
+      setProgress(1);
 
       // AUTO-PRELOAD: In DEMO_SAFE_MODE, auto-load demo document for instant start
       if (DEMO_SAFE_MODE) {
@@ -343,6 +472,17 @@ export function HackathonWinner() {
       setProgress(1);
       setAppState('welcome');
       setStatusMessage('');
+
+      window.setTimeout(() => {
+        if (ModelManager.getLoadedModel(ModelCategory.Language)) {
+          setLlmState('ready');
+          return;
+        }
+
+        if (llmState === 'idle') {
+          loadLLM().catch((warmErr) => console.warn('[LLM] Welcome warmup skipped:', warmErr));
+        }
+      }, 300);
 
       // Auto-load demo document if DEMO_SAFE_MODE (uncomment for auto-demo)
       // if (DEMO_SAFE_MODE) {
@@ -360,6 +500,132 @@ export function HackathonWinner() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const startBackgroundSemanticIndex = useCallback((docId: string) => {
+    setSemanticState('indexing');
+    setSemanticProgress(0);
+
+    DocumentStore.ensureEmbeddings(docId, (_status, progressValue) => {
+      setSemanticState('indexing');
+      setSemanticProgress(progressValue);
+    })
+      .then((updatedDoc) => {
+        if (!updatedDoc) return;
+        setSemanticState('ready');
+        setSemanticProgress(1);
+        setCurrentDocument((prev) => (prev?.id === updatedDoc.id ? updatedDoc : prev));
+      })
+      .catch((error) => {
+        console.warn('[RAG] Semantic indexing failed:', error);
+        setSemanticState('idle');
+      });
+  }, []);
+
+  const warmWorkspace = useCallback((docId: string) => {
+    startBackgroundSemanticIndex(docId);
+
+    if (llmState === 'idle') {
+      loadLLM().catch((error) => console.warn('[LLM] Auto warmup failed:', error));
+    }
+  }, [llmState, startBackgroundSemanticIndex]);
+
+  const buildRagContext = useCallback(async (query: string) => {
+    if (!currentDocument) {
+      return { context: '', sourceCount: 0, retrievalMode: 'none' as const };
+    }
+
+    const hits = await DocumentStore.searchDocument(currentDocument.id, query, 2);
+    const context = hits
+      .map((hit, index) => `[${index + 1}] ${hit.chunk.replace(/\s+/g, ' ').trim().slice(0, 120)}`)
+      .join('\n\n');
+
+    return {
+      context,
+      sourceCount: hits.length,
+      retrievalMode: hits.some((hit) => hit.embeddingScore > 0.05) ? 'semantic' as const : 'keyword' as const,
+    };
+  }, [currentDocument]);
+
+  const formatRetrievalPreview = useCallback((query: string, retrievedContext: string, _retrievalMode: 'semantic' | 'keyword' | 'none') => {
+    const analysisResponse = documentAnalysis
+      ? DocumentAnalyzer.generateResponse(documentAnalysis, query, pdfName || 'Document')
+      : '';
+    const extractionFallback = generateTextExtractionFallback(currentDocument?.text || '', query, pdfName || 'Document');
+    const fallback = extractionFallback;
+    const retrievalMode = _retrievalMode;
+
+    if (!retrievedContext) {
+      return buildStructuredAnswer(query, analysisResponse, extractionFallback);
+    }
+
+    return buildStructuredAnswer(query, retrievedContext, analysisResponse, extractionFallback);
+
+    const queryTerms = query
+      .toLowerCase()
+      .split(/\s+/)
+      .map((term) => term.replace(/[^a-z0-9]/g, ''))
+      .filter((term) => term.length >= 3);
+
+    const evidenceLines = retrievedContext
+      .split(/\n\n/)
+      .flatMap((chunk) => {
+        const cleanedChunk = chunk
+          .replace(/^\[\d+\]\s*/, '')
+          .replace(/[^\x20-\x7E]+/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        return cleanedChunk
+          .split(/[.!?]+/)
+          .map((sentence) => sentence.replace(/[^\x20-\x7E]+/g, ' ').replace(/\s+/g, ' ').trim())
+          .filter((sentence) => sentence.length >= 28 && sentence.length <= 220);
+      })
+      .map((sentence) => {
+        const lower = sentence.toLowerCase();
+        const overlap = queryTerms.reduce((score, term) => score + (lower.includes(term) ? 2 : 0), 0);
+        const numericBonus = /\d/.test(sentence) ? 0.4 : 0;
+        const lengthBonus = sentence.length >= 60 && sentence.length <= 170 ? 0.5 : 0;
+        return {
+          sentence: `${sentence}${sentence.endsWith('.') ? '' : '.'}`,
+          score: overlap + numericBonus + lengthBonus,
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .map((item) => item.sentence)
+      .filter((sentence, index, arr) => arr.indexOf(sentence) === index)
+      .slice(0, 3);
+
+    const primary = evidenceLines[0] || fallback;
+    const secondary = evidenceLines[1] || 'The retrieved context supports the same conclusion in another section of the document.';
+    const tertiary = evidenceLines[2] || secondary;
+    const sourceLabel = retrievalMode === 'semantic'
+      ? 'Semantic retrieval match from your document.'
+      : 'Keyword retrieval match from your document.';
+
+    if (explainMode === 'simple') {
+      return `**Answer**\n\n${primary}\n\n_${sourceLabel}_`;
+    }
+
+    if (explainMode === 'exam') {
+      return `**Direct Answer**\n\n${primary}\n\n**Study Points**\n\n- ${secondary}\n- ${tertiary}\n\n_${sourceLabel}_`;
+    }
+
+    return `**Answer**\n\n${primary}\n\n**Supporting Points**\n\n- ${secondary}\n- ${tertiary}\n\n_${sourceLabel}_`;
+
+    const bullets = retrievedContext
+      .split(/\n\n/)
+      .slice(0, 2)
+      .map((chunk) => {
+        const cleaned = chunk.replace(/^\[\d+\]\s*/, '').trim();
+        const firstSentence = cleaned.split(/[.!?]+/).find((sentence) => sentence.trim().length > 30)?.trim() || cleaned;
+        return firstSentence.slice(0, 160).trim();
+      })
+      .filter(Boolean)
+      .map((chunk) => `• ${chunk}${chunk.endsWith('.') ? '' : '.'}`)
+      .join('\n');
+
+    return fallback;
+  }, [currentDocument?.text, documentAnalysis, explainMode, pdfName]);
+
   // -------------------------------------------------------------------------
   // MODEL LOADING
   // -------------------------------------------------------------------------
@@ -372,6 +638,9 @@ export function HackathonWinner() {
       const loadStart = Date.now();
       setLlmState('downloading');
       setLlmProgress(0);
+      setStatusMessage('Preparing local AI runtime...');
+
+      await ensureLLMRuntime();
 
       // Log acceleration mode
       const accelMode = getAccelerationMode();
@@ -394,31 +663,34 @@ export function HackathonWinner() {
       }
 
       setLlmState('loading');
+      setStatusMessage('Loading compact local model...');
 
       const loadModelStart = Date.now();
       await ModelManager.loadModel(model.id);
       console.log(`[PERF] Model load to memory: ${Date.now() - loadModelStart}ms`);
 
-      // CRITICAL: Warmup the model to avoid cold-start latency
-      console.log('[LLM] Running warmup...');
-      const warmupStart = Date.now();
-      try {
-        const warmupResult = await TextGeneration.generate('Hello', {
-          maxTokens: 5,
-          temperature: 0.1,
-        });
-        console.log(`[PERF] Model warmup: ${Date.now() - warmupStart}ms`);
-        console.log('[LLM] Warmup response:', warmupResult.text?.slice(0, 50));
-      } catch (warmupErr) {
-        console.warn('[LLM] Warmup failed (non-critical):', warmupErr);
-      }
-
       console.log(`[PERF] Total LLM initialization: ${Date.now() - loadStart}ms`);
       setLlmState('ready');
+      setStatusMessage('');
+
+      window.setTimeout(async () => {
+        try {
+          const TextGeneration = await getTextGenerationApi();
+          await TextGeneration.generate('Ready.', {
+            maxTokens: 4,
+            temperature: 0.1,
+          });
+          console.log('[LLM] Background warmup complete');
+        } catch (warmupErr) {
+          console.warn('[LLM] Warmup skipped:', warmupErr);
+        }
+      }, 0);
+
       return true; // Return true on successful load
     } catch (error) {
       console.error('LLM load error:', error);
       setLlmState('error');
+      setStatusMessage('');
       return false;
     }
   };
@@ -432,52 +704,36 @@ export function HackathonWinner() {
 
     try {
       setAppState('processing');
-      setStatusMessage('Reading document...');
+      setStatusMessage('Extracting text in a background worker...');
       setProgress(0.1);
 
       // Clear demo mode and old analysis when uploading new document
       // CRITICAL: This is a REAL document, not a demo document
       setIsDemoDocument(false);
-      setDemoMode(false);
       setDocumentAnalysis(null);
+      setSemanticState('idle');
+      setSemanticProgress(0);
       DocumentAnalyzer.clearCache(); // Clear any previous analysis cache
 
-      const arrayBuffer = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const doc = await DocumentStore.addDocument(file, (status, prog) => {
+        setStatusMessage(status);
+        setProgress(0.12 + prog * 0.68);
+      }, { includeEmbeddings: false });
 
-      setPageCount(pdf.numPages);
-      setProgress(0.3);
-      setStatusMessage('Extracting text...');
-
-      let fullText = '';
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const content = await page.getTextContent();
-        const pageText = content.items.map((item: any) => item.str).join(' ');
-        fullText += pageText + '\n\n';
-        setProgress(0.3 + (i / pdf.numPages) * 0.4);
-      }
-
-      setPdfText(fullText.trim());
+      setPdfText(doc.text);
       setPdfName(file.name);
-      setProgress(0.7);
-      setStatusMessage('Analyzing document...');
+      setPageCount(doc.pages);
+      setProgress(0.84);
+      setStatusMessage('Building instant answer index...');
 
       // DUAL-MODE: Fast document analysis for real documents (no LLM needed)
-      const docId = `doc-${Date.now()}-${file.name}`;
-      const analysis = await DocumentAnalyzer.analyzeDocument(docId, fullText);
+      const analysis = await DocumentAnalyzer.analyzeDocument(doc.id, doc.text);
       setDocumentAnalysis(analysis);
       console.log(`[DocumentAnalyzer] Fast analysis complete: ${analysis.keywords.slice(0, 5).join(', ')}`);
 
       // Add to document store (quick — no embeddings yet)
-      const doc = await DocumentStore.addDocument(file, (status, prog) => {
-        setStatusMessage(status);
-        setProgress(0.7 + prog * 0.1);
-      });
-
       setCurrentDocument(doc);
-      setDemoMode(false);
-      setIsDemoDocument(false); // Confirm: this is NOT a demo document
+      setIsDemoDocument(false);
       console.log('[MODE] Real document uploaded - isDemoDocument=false, demoMode=false');
 
       // Generate stats from analysis
@@ -488,18 +744,18 @@ export function HackathonWinner() {
       });
 
       // Smart suggestions from DocumentAnalyzer (context-aware)
-      const suggestions = DocumentAnalyzer.getSuggestedQueries(analysis);
-      setSmartSuggestions(suggestions);
+      setSmartSuggestions(DocumentAnalyzer.getSuggestedQueries(analysis));
 
       // Mark as READY immediately — user can start asking questions
       setAppState('ready');
       setGuideStep(1);
-      setProgress(0.8);
+      setProgress(1);
 
-      addMessage('assistant', `I've analyzed **"${file.name}"** (${pdf.numPages} pages, ~${analysis.stats.wordCount.toLocaleString()} words).\n\nAsk me anything about this document! Semantic search is being prepared in the background.`);
+      addMessage('assistant', `**"${file.name}"** is ready. I indexed ${doc.pages} pages and ~${analysis.stats.wordCount.toLocaleString()} words for fast local answers.\n\nStart with Fast mode for instant responses, then switch to Deep mode when you want model-generated refinement.`);
 
       // addDocument already performs extraction/chunking; keep UI responsive.
       setStatusMessage('');
+      warmWorkspace(doc.id);
 
     } catch (error) {
       console.error('PDF processing error:', error);
@@ -588,7 +844,8 @@ REFERENCES
     setAppState('ready');
     setGuideStep(1);
     setIsDemoDocument(true);  // CRITICAL: This IS a demo document
-    setDemoMode(true);
+    setSemanticState('ready');
+    setSemanticProgress(1);
     setDocumentAnalysis(null); // Clear analysis so demo uses PerceptionEngine
     console.log('[MODE] Demo document loaded - isDemoDocument=true, demoMode=true');
 
@@ -629,128 +886,150 @@ REFERENCES
   // QUERY HANDLING
   // -------------------------------------------------------------------------
 
-  const generateWithLLM = async (query: string, context: string, targetMsgId?: string, prefix?: string): Promise<string> => {
+  const pushAssistantMessage = (content: string, cached = false, sources?: string[]) => {
+    const msgId = addMessage('assistant', content, cached, sources);
+    setStatusMessage('');
+    setAppState('ready');
+    return msgId;
+  };
+
+  const generateWithLLM = async (
+    query: string,
+    context: string,
+    options: { targetMsgId?: string; silent?: boolean } = {},
+  ): Promise<string> => {
+    const { targetMsgId, silent = false } = options;
     const genStart = Date.now();
+
     try {
-      // ULTRA-OPTIMIZED: Minimal prompts for sub-3-second responses
-      const systemPrompts = {
-        simple: 'One sentence only.',
-        detailed: '2-3 sentences max.',
-        exam: 'Brief definition + 2 points.'
+      const trimmedContext = context
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 300);
+
+      // FIXED: Actually use the user's query in the prompt!
+      const modeInstructions = {
+        simple: 'Answer in 1-2 simple sentences.',
+        detailed: 'Give a detailed answer with 2-3 key points.',
+        exam: 'Provide a clear definition and 2 exam-ready bullet points.'
       };
 
-      // AGGRESSIVE: Minimal context (80 chars max) to reduce prefill latency
-      const trimmedContext = context.slice(0, 80).replace(/\s+/g, ' ').trim();
-      const shortQuery = query.slice(0, 50);
-      const prompt = `${systemPrompts[explainMode]} Context:"${trimmedContext}" Q:${shortQuery} A:`;
+      const prompt = `Question: ${query}
 
-      console.log(`[LLM] Prompt: ${prompt.length} chars (target: <200)`);
+Context: ${trimmedContext}
 
-      // ULTRA-AGGRESSIVE: 30 tokens max for speed
-      const maxTokens = 30;
+${modeInstructions[explainMode] || modeInstructions.simple}
 
-      const { stream, result: resultPromise, cancel } = await TextGeneration.generateStream(prompt, {
+Answer:`;
+
+      const maxTokens = 60;
+      const TextGeneration = await getTextGenerationApi();
+      const { stream, cancel } = await TextGeneration.generateStream(prompt, {
         maxTokens,
-        temperature: 0.2,  // Very low = fast + deterministic
+        temperature: 0.1,
       });
 
-      cancelRef.current = cancel;
-      setAppState('streaming');
-      setStatusMessage('');
+      if (!silent) {
+        cancelRef.current = cancel;
+        setAppState('streaming');
+        setStatusMessage('Refining answer...');
+      }
 
-      const msgId = targetMsgId || addMessage('assistant', prefix || '');
-
-      let accumulated = prefix || '';
+      const msgId = !silent ? (targetMsgId || addMessage('assistant', '')) : undefined;
+      let accumulated = '';
+      let generatedText = '';
       let tokenCount = 0;
-      let firstTokenLogged = false;
 
       for await (const token of stream) {
-        if (!firstTokenLogged) {
-          console.log(`[PERF] First token: ${Date.now() - genStart}ms`);
-          firstTokenLogged = true;
-        }
         accumulated += token;
+        generatedText += token;
         tokenCount++;
-        updateMessage(msgId, accumulated, true);
 
-        // EARLY EXIT: Stop after enough content
-        if (tokenCount >= 25 || accumulated.length > 150) {
-          console.log('[LLM] Early exit - enough content');
+        if (!silent && msgId) {
+          updateMessage(msgId, buildStructuredAnswer(query, accumulated, context), true);
+        }
+
+        const bulletCount = generatedText
+          .split('\n')
+          .filter((line) => line.trim().startsWith('-'))
+          .length;
+
+        if (bulletCount >= 3 || tokenCount >= maxTokens - 2 || generatedText.length > 120 || Date.now() - genStart > 1800) {
           cancel();
           break;
         }
       }
 
-      // Don't wait for full result if we have content
-      const totalTime = Date.now() - genStart;
-      console.log(`[PERF] Done: ${totalTime}ms, ${tokenCount} tokens`);
+      const finalResponse = accumulated.trim() || buildStructuredAnswer(query, context);
 
-      updateMessage(msgId, accumulated.trim() || 'Based on the document, this relates to the key concepts discussed.', false);
-      cancelRef.current = null;
-      setAppState('ready');
+      if (!silent && msgId) {
+        updateMessage(msgId, buildStructuredAnswer(query, finalResponse, context), false);
+        cancelRef.current = null;
+        setStatusMessage('');
+        setAppState('ready');
+      }
 
-      return accumulated.trim();
-
+      return finalResponse;
     } catch (error) {
-      console.error('[LLM] Error:', error);
-      console.log(`[PERF] Failed after: ${Date.now() - genStart}ms`);
+      if (!silent) {
+        cancelRef.current = null;
+        setStatusMessage('');
+        setAppState('ready');
+      }
       throw error;
     }
   };
 
-  const simulateStream = async (text: string, isCached = false) => {
-    setAppState('streaming');
-    setStatusMessage('');
+  const refineRealDocumentResponse = useCallback(async (query: string, context: string, msgId: string) => {
+    if (!currentDocument || llmState !== 'ready' || !context) {
+      return;
+    }
+    const cacheIntent = detectCacheIntent(query);
 
-    const msgId = addMessage('assistant', '', isCached);
-
-    let accumulated = '';
-    // OPTIMIZED: Faster streaming for perceived speed (5-12ms vs 8-20ms)
-    for (const chunk of streamText(text, 4)) {
-      accumulated += chunk;
-      updateMessage(msgId, accumulated, true);
-      await new Promise(r => setTimeout(r, isCached ? 3 : 5 + Math.random() * 7));
+    if (refinementActiveRef.current.has(msgId)) {
+      return;
     }
 
-    updateMessage(msgId, accumulated.trim(), false);
-    setAppState('ready');
-  };
+    refinementActiveRef.current.add(msgId);
+
+    try {
+      const refined = await Promise.race<string>([
+        generateWithLLM(query, context, { silent: true }),
+        new Promise<string>((_, reject) => setTimeout(() => reject(new Error('refinement-timeout')), 1900)),
+      ]);
+
+      const normalized = buildStructuredAnswer(query, refined, context);
+      if (normalized.trim().length > 24) {
+        updateMessage(msgId, normalized, false);
+        await QueryCache.save(query, normalized, [context], {
+          cacheType: 'rag',
+          mode: explainMode,
+          documentId: currentDocument.id,
+          intent: cacheIntent,
+        });
+      }
+    } catch (error) {
+      console.warn('[RAG] Silent refinement skipped:', error);
+    } finally {
+      refinementActiveRef.current.delete(msgId);
+    }
+  }, [currentDocument, explainMode, llmState]);
 
   const handleSendMessage = async (customQuery?: string) => {
     const query = (customQuery || inputValue).trim();
     if (!query) return;
     if (appState === 'thinking' || appState === 'streaming') return;
+    const cacheIntent = detectCacheIntent(query);
+    console.log(`[Router] mode=${isDemoDocument ? 'demo' : currentDocument ? 'rag' : 'none'} query="${query}" intent=${cacheIntent}`);
 
     setInputValue('');
     addMessage('user', query);
     setGuideStep(Math.max(guideStep, 2));
 
-    // Cancel any pending typing animation
-    if (typingCancelRef.current) {
-      typingCancelRef.current();
-      typingCancelRef.current = null;
-    }
-
-    const queryId = `query-${Date.now()}`;
-    const startTime = performance.now();
-
-    // DEBUG: Log mode state before processing query
-    console.log('[MODE CHECK]', {
-      isDemoDocument,
-      demoMode,
-      hasDocumentAnalysis: !!documentAnalysis,
-      hasCurrentDocument: !!currentDocument,
-      DEMO_SAFE_MODE
-    });
-
     try {
-      // ========================================================================
-      // DEMO DOCUMENT: Use PerceptionEngine for instant, polished responses
-      // This ONLY triggers for demo documents (isDemoDocument === true)
-      // ========================================================================
       if (isDemoDocument) {
-        setAppState('streaming');
-        setStatusMessage('');
+        setAppState('thinking');
+        setStatusMessage('Preparing answer...');
 
         const instantResponse = await PerceptionEngine.getInstantResponse(
           query,
@@ -759,141 +1038,114 @@ REFERENCES
           explainMode
         );
 
-        console.log(`[PerceptionEngine] Demo response in ${(performance.now() - startTime).toFixed(0)}ms`);
-
-        const msgId = addMessage('assistant', '', true); // Mark as cached for speed badge
-
-        // Fast typing animation - optimized for demo
-        await new Promise<void>((resolve) => {
-          typingCancelRef.current = createTypingAnimation(
-            instantResponse.text,
-            (partial) => updateMessage(msgId, partial, true),
-            () => {
-              updateMessage(msgId, instantResponse.text, false);
-              resolve();
-            },
-            4 // ULTRA FASTER: 4ms per word chunk
-          );
+        const demoAnswer = buildStructuredAnswer(query, instantResponse.text, currentDocument?.text?.slice(0, 240));
+        pushAssistantMessage(demoAnswer, true);
+        await QueryCache.save(query, demoAnswer, [], {
+          cacheType: 'demo',
+          mode: explainMode,
+          documentId: currentDocument?.id,
+          intent: cacheIntent,
         });
-
-        setAppState('ready');
-        return; // EXIT - demo response shown
+        return;
       }
 
-      // ========================================================================
-      // REAL DOCUMENT MODE: ALWAYS use DocumentAnalyzer for user-uploaded docs
-      // NEVER falls back to PerceptionEngine - uses text extraction instead
-      // ========================================================================
-      if (!isDemoDocument && currentDocument) {
-        setAppState('streaming');
-        setStatusMessage('');
+      if (currentDocument) {
+        setAppState('thinking');
+        setStatusMessage('Retrieving relevant context...');
 
-        let responseText: string;
-
-        // Primary: Use document analysis if available
-        if (documentAnalysis) {
-          responseText = DocumentAnalyzer.generateResponse(
-            documentAnalysis,
-            query,
-            pdfName || 'Document'
-          );
-          console.log(`[DocumentAnalyzer] Instant response in ${(performance.now() - startTime).toFixed(0)}ms`);
-        } else {
-          // FAILSAFE: Generate response from raw text (no PerceptionEngine!)
-          console.warn('[DocumentAnalyzer] No analysis available - using text extraction fallback');
-          responseText = generateTextExtractionFallback(currentDocument.text, query, pdfName || 'Document');
+        const ragCached = await QueryCache.get(query, {
+          cacheType: 'rag',
+          mode: explainMode,
+          documentId: currentDocument.id,
+          intent: cacheIntent,
+        });
+        if (ragCached) {
+          pushAssistantMessage(buildStructuredAnswer(query, ragCached.response), true, ragCached.context);
+          if (llmState === 'idle') {
+            loadLLM().catch((error) => console.warn('[LLM] Background warmup failed:', error));
+          }
+          return;
         }
 
-        const msgId = addMessage('assistant', '', true);
+        const heuristicCached = await QueryCache.get(query, {
+          cacheType: 'heuristic',
+          mode: explainMode,
+          documentId: currentDocument.id,
+          intent: cacheIntent,
+        });
+        if (heuristicCached) {
+          pushAssistantMessage(buildStructuredAnswer(query, heuristicCached.response), true, heuristicCached.context);
+          if (llmState === 'idle') {
+            loadLLM().catch((error) => console.warn('[LLM] Background warmup failed:', error));
+          }
+          return;
+        }
 
-        // Typing animation for perceived intelligence
-        await new Promise<void>((resolve) => {
-          typingCancelRef.current = createTypingAnimation(
-            responseText,
-            (partial) => updateMessage(msgId, partial, true),
-            () => {
-              updateMessage(msgId, responseText, false);
-              resolve();
-            },
-            4 // ULTRA FAST: 4ms per chunk for zero-latency real documents
-          );
+        const precomputed = DocumentStore.getCommonAnswer(currentDocument.id, query);
+        if (precomputed) {
+          const structured = buildStructuredAnswer(query, precomputed);
+          pushAssistantMessage(structured, true);
+          await QueryCache.save(query, structured, [], {
+            cacheType: 'heuristic',
+            mode: explainMode,
+            documentId: currentDocument.id,
+            intent: cacheIntent,
+          });
+          if (llmState === 'idle') {
+            loadLLM().catch((error) => console.warn('[LLM] Background warmup failed:', error));
+          }
+          return;
+        }
+
+        const { context, sourceCount, retrievalMode } = await Promise.race([
+          buildRagContext(query),
+          new Promise<{ context: string; sourceCount: number; retrievalMode: 'none' }>((resolve) =>
+            setTimeout(() => resolve({ context: '', sourceCount: 0, retrievalMode: 'none' }), 1500)
+          ),
+        ]);
+
+        const structuredAnswer = formatRetrievalPreview(query, context, retrievalMode);
+        const msgId = pushAssistantMessage(structuredAnswer, false, context ? [context] : []);
+        await QueryCache.save(query, structuredAnswer, context ? [context] : [], {
+          cacheType: 'rag',
+          mode: explainMode,
+          documentId: currentDocument.id,
+          intent: cacheIntent,
         });
 
-        setAppState('ready');
-
-        // Optional: Background LLM refinement for real documents (if available and not in safe mode)
-        if (llmState === 'ready' && !DEMO_SAFE_MODE) {
-          const refinementQueryId = `refine-${queryId}`;
-          refinementActiveRef.current.add(refinementQueryId);
-          const responseStartTime = Date.now();
-
-          // Register callback for refinement
-          PerceptionEngine.onRefinement(refinementQueryId, (refinedText) => {
-            const refinementTime = Date.now() - responseStartTime;
-            if (refinementActiveRef.current.has(refinementQueryId) && refinementTime < LLM_REFINEMENT_TIMEOUT_MS) {
-              updateMessage(msgId, refinedText + '\n\n✨ *AI-enhanced*', false);
-              QueryCache.save(query, refinedText, [], explainMode, currentDocument?.id);
-            }
-            refinementActiveRef.current.delete(refinementQueryId);
-          });
-
-          // Get context and trigger background refinement
-          getQuickContext(query).then(context => {
-            PerceptionEngine.triggerBackgroundRefinement(
-              refinementQueryId,
-              query,
-              context,
-              async (q, ctx) => generateWithLLM(q, ctx),
-              LLM_REFINEMENT_TIMEOUT_MS
-            ).catch(() => {
-              refinementActiveRef.current.delete(refinementQueryId);
-            });
-          });
+        if (context && sourceCount > 0) {
+          if (llmState === 'ready') {
+            void refineRealDocumentResponse(query, context, msgId);
+          } else if (llmState === 'idle') {
+            loadLLM().catch((error) => console.warn('[LLM] Background warmup failed:', error));
+          }
         }
-
-        return; // EXIT - real document response shown
+        return;
       }
 
-      // ========================================================================
-      // FALLBACK: No document loaded - provide helpful guidance
-      // ========================================================================
-      console.log('[FALLBACK] No document loaded');
-      const fallbackText = "Please upload a document first! You can drag and drop a PDF or click the upload button to get started.";
-      const msgId = addMessage('assistant', '', true);
-      await new Promise<void>((resolve) => {
-        typingCancelRef.current = createTypingAnimation(
-          fallbackText,
-          (partial) => updateMessage(msgId, partial, true),
-          () => { updateMessage(msgId, fallbackText, false); resolve(); },
-          10
-        );
-      });
-      setAppState('ready');
+      pushAssistantMessage(
+        'Please upload a document first. Choose a file on the welcome screen to open the workspace.',
+        true,
+      );
       return;
-
     } catch (error) {
       console.error('Query error:', error);
-      // FAILSAFE: Never show errors - always provide a response
-      // For real documents, use text extraction fallback (NOT PerceptionEngine!)
       let fallbackText: string;
+
       if (currentDocument && !isDemoDocument) {
-        fallbackText = generateTextExtractionFallback(currentDocument.text, query, pdfName || 'Document');
+        fallbackText = buildStructuredAnswer(
+          query,
+          generateTextExtractionFallback(currentDocument.text, query, pdfName || 'Document'),
+          documentAnalysis ? DocumentAnalyzer.generateResponse(documentAnalysis, query, pdfName || 'Document') : '',
+        );
       } else if (currentDocument) {
-        fallbackText = `**From the document:**\n\n"${currentDocument.text.slice(0, 300)}..."\n\n*Relevant excerpt from your document.*`;
+        fallbackText = buildStructuredAnswer(query, currentDocument.text.slice(0, 240));
       } else {
-        fallbackText = getIntelligentResponse(query);
+        fallbackText = buildStructuredAnswer(query, getIntelligentResponse(query));
       }
 
-      const msgId = addMessage('assistant', '', true);
-      await new Promise<void>((resolve) => {
-        typingCancelRef.current = createTypingAnimation(
-          fallbackText,
-          (partial) => updateMessage(msgId, partial, true),
-          () => { updateMessage(msgId, fallbackText, false); resolve(); },
-          4 // Match 4ms speed
-        );
-      });
-      setAppState('ready');
+      pushAssistantMessage(fallbackText, true);
+      return;
     }
   };
 
@@ -957,18 +1209,14 @@ REFERENCES
       const bullets = uniqueSentences
         .slice(0, 3)
         .map(s => {
-          // Shorten long sentences
           const words = s.split(/\s+/);
           const shortened = words.length > 25 ? words.slice(0, 25).join(' ') + '...' : s;
-          // Ensure proper capitalization
           const formatted = shortened.charAt(0).toUpperCase() + shortened.slice(1);
-          // Ensure ends with period
           return formatted.endsWith('.') ? formatted : formatted + '.';
         })
-        .map(s => `\u2022 ${s}`)
         .join('\n');
 
-      return `**Key Insights**\n\nBased on the document, here are the key insights:\n\n${bullets}`;
+      return buildStructuredAnswer(query, bullets);
     }
 
     // Ultimate fallback: structured excerpt as bullets
@@ -991,7 +1239,7 @@ REFERENCES
       .slice(0, 3)
       .map(s => {
         const formatted = s.charAt(0).toUpperCase() + s.slice(1);
-        return `\u2022 ${formatted.endsWith('.') ? formatted : formatted + '.'}`;
+        return formatted.endsWith('.') ? formatted : formatted + '.';
       })
       .join('\n');
 
@@ -1101,6 +1349,7 @@ REFERENCES
             const audioData = decodedAudio.getChannelData(0);
 
             // Time-limited STT attempt (max 3 seconds)
+            const STT = await getSTTApi();
             const sttPromise = STT.transcribe(audioData);
             const timeoutPromise = new Promise((_, reject) =>
               setTimeout(() => reject(new Error('STT timeout')), 3000)
@@ -1200,79 +1449,202 @@ REFERENCES
     );
   }
 
+  if (appState === 'welcome' && !currentDocument) {
+    return (
+      <div style={styles.welcomeScreen}>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".pdf,.txt"
+          onChange={(e) => e.target.files?.[0] && handleFileSelect(e.target.files[0])}
+          style={{ display: 'none' }}
+        />
+
+        <div style={styles.welcomeShell}>
+          <div style={styles.welcomeHero}>
+            <div style={styles.welcomeEyebrow}>Premium Offline AI Research Copilot</div>
+            <h1 style={styles.welcomeTitle}>Your documents. Your device. Zero cloud dependency.</h1>
+            <p style={styles.welcomeCopy}>
+              Enterprise-grade document intelligence that runs entirely on your machine. Upload any PDF, get instant answers powered by local AI.
+              No data leaves your device — complete privacy guaranteed.
+            </p>
+
+            <div style={styles.welcomeActions}>
+              <motion.button
+                style={styles.welcomePrimary}
+                onClick={() => fileInputRef.current?.click()}
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+              >
+                Open Document
+              </motion.button>
+              <motion.button
+                style={styles.welcomeSecondary}
+                onClick={loadDemoDocument}
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+              >
+                Launch Demo Workspace
+              </motion.button>
+            </div>
+          </div>
+
+          <div style={styles.welcomeRail}>
+            <div style={styles.welcomeCardLarge}>
+              <div style={styles.welcomeCardLabel}>How it feels</div>
+              <div style={styles.welcomeMetricRow}>
+                <div>
+                  <div style={styles.welcomeMetricValue}>&lt;1s</div>
+                  <div style={styles.welcomeMetricText}>retrieval preview</div>
+                </div>
+                <div>
+                  <div style={styles.welcomeMetricValue}>Local</div>
+                  <div style={styles.welcomeMetricText}>model + storage</div>
+                </div>
+                <div>
+                  <div style={styles.welcomeMetricValue}>RAG</div>
+                  <div style={styles.welcomeMetricText}>keyword then semantic</div>
+                </div>
+              </div>
+            </div>
+
+            {[
+              ['Step 1', 'Choose a PDF to enter the workspace.'],
+              ['Step 2', 'We extract chunks first, then build semantic search in the background.'],
+              ['Step 3', 'Queries use retrieved evidence immediately, then local generation upgrades the final answer.'],
+            ].map(([label, text]) => (
+              <div key={label} style={styles.welcomeCard}>
+                <div style={styles.welcomeCardLabel}>{label}</div>
+                <p style={styles.welcomeCardText}>{text}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <style>{globalCSS}</style>
+      </div>
+    );
+  }
+
   // -------------------------------------------------------------------------
   // RENDER - MAIN APP
   // -------------------------------------------------------------------------
 
   return (
     <div style={styles.container}>
-      {/* HEADER */}
+      {/* HEADER - Premium Tier 1 Design */}
       <header style={styles.header}>
         <div style={styles.headerLeft}>
           <div style={styles.logo}>
-            <span style={styles.logoIcon}>AI</span>
-            <span style={styles.logoText}>Research Copilot</span>
+            <motion.span
+              style={styles.logoIcon}
+              animate={{
+                boxShadow: llmState === 'ready'
+                  ? ['0 0 20px rgba(99,102,241,0.3)', '0 0 30px rgba(168,85,247,0.4)', '0 0 20px rgba(99,102,241,0.3)']
+                  : '0 0 0px transparent'
+              }}
+              transition={{ repeat: Infinity, duration: 2 }}
+            >AI</motion.span>
+            <div>
+              <span style={styles.logoText}>Research Copilot</span>
+              <div style={styles.logoSubtext}>Enterprise Document Intelligence</div>
+            </div>
           </div>
         </div>
 
         <div style={styles.headerCenter}>
-          {/* ENHANCED: Offline-first badge always visible */}
+          {/* Analysis Mode Indicator - Always Visible */}
           <motion.div
             style={{
-              ...styles.badge,
-              ...styles.badgePrivacy
+              ...styles.modeIndicator,
+              background: llmState === 'ready'
+                ? 'linear-gradient(135deg, rgba(52,211,153,0.12) 0%, rgba(16,185,129,0.08) 100%)'
+                : 'linear-gradient(135deg, rgba(102,126,234,0.12) 0%, rgba(118,75,162,0.08) 100%)',
+              borderColor: llmState === 'ready' ? 'rgba(52,211,153,0.4)' : 'rgba(102,126,234,0.4)'
             }}
             animate={{ scale: [1, 1.02, 1] }}
-            transition={{ repeat: Infinity, duration: 4 }}
+            transition={{ repeat: Infinity, duration: 4, ease: 'easeInOut' }}
           >
-            <span>🔒</span>
-            Running 100% Locally
+            <motion.div
+              style={{
+                ...styles.modeDot,
+                background: llmState === 'ready' ? '#34d399' : '#667eea'
+              }}
+              animate={{ scale: [1, 1.4, 1], opacity: [1, 0.6, 1] }}
+              transition={{ repeat: Infinity, duration: 2 }}
+            />
+            <div style={styles.modeContent}>
+              <span style={{...styles.modeText, color: llmState === 'ready' ? '#34d399' : '#ffd79a'}}>
+                {llmState === 'ready' ? 'Grounded AI Ready' : 'Grounded Retrieval'}
+              </span>
+              <span style={styles.modeSubLabel}>
+                {llmState === 'ready' ? 'Compact model active for follow-ups' : 'Retrieval-grounded answers are ready instantly'}
+              </span>
+            </div>
           </motion.div>
 
-          <motion.div
-            style={{
-              ...styles.badge,
-              ...(isOnline ? styles.badgeOnline : styles.badgeOfflineReady)
-            }}
-          >
+          {/* Privacy Badge */}
+          <div style={{...styles.badge, ...styles.badgePrivacy}}>
+            <span>🔒</span>
+            100% Local
+          </div>
+
+          {/* Connection Status */}
+          <div style={{...styles.badge, ...(isOnline ? styles.badgeOnline : styles.badgeOfflineReady)}}>
             <span style={styles.badgeDot} />
-            {isOnline ? 'Online' : '📴 Offline Ready'}
-          </motion.div>
+            {isOnline ? 'Online' : 'Offline Ready'}
+          </div>
 
           {isDemoDocument && (
-            <div style={{ ...styles.badge, ...styles.badgeDemo }}>
-              ⚡ DEMO MODE
-            </div>
-          )}
-
-          {llmState === 'ready' && (
-            <div style={{ ...styles.badge, background: 'rgba(16, 185, 129, 0.1)', borderColor: '#10b981', color: '#10b981' }}>
-              ✓ AI Ready
-            </div>
+            <motion.div
+              style={{...styles.badge, ...styles.badgeDemo}}
+              animate={{ scale: [1, 1.05, 1] }}
+              transition={{ repeat: Infinity, duration: 2 }}
+            >
+              ⚡ Demo Mode
+            </motion.div>
           )}
         </div>
 
         <div style={styles.headerRight}>
-          {llmState !== 'ready' && (
+          {/* AI Model Control - Premium Button */}
+          {llmState !== 'ready' ? (
             <motion.button
-              style={{
-                ...styles.actionBtn,
-                background: 'rgba(99, 102, 241, 0.15)',
-                color: '#818cf8',
-                border: '1px solid rgba(99, 102, 241, 0.4)',
-                padding: '6px 14px',
-                marginRight: '12px',
-                fontWeight: 600
-              }}
+              style={styles.initButton}
               onClick={loadLLM}
               disabled={llmState === 'downloading' || llmState === 'loading'}
-              whileHover={{ scale: 1.05, background: 'rgba(99, 102, 241, 0.25)' }}
-              whileTap={{ scale: 0.95 }}
+              whileHover={{ scale: 1.03, boxShadow: '0 4px 25px rgba(99,102,241,0.4)' }}
+              whileTap={{ scale: 0.97 }}
             >
-              {llmState === 'idle' ? '🚀 Initialize AI Model' : `Downloading... ${Math.round(llmProgress * 100)}%`}
+              {llmState === 'idle' && (
+                <>
+                  <span style={styles.initIcon}>🚀</span>
+                  <span>Initialize AI</span>
+                </>
+              )}
+              {(llmState === 'downloading' || llmState === 'loading') && (
+                <>
+                  <motion.div
+                    style={styles.miniSpinner}
+                    animate={{ rotate: 360 }}
+                    transition={{ repeat: Infinity, duration: 1, ease: 'linear' }}
+                  />
+                  <span>{Math.round(llmProgress * 100)}%</span>
+                </>
+              )}
             </motion.button>
+          ) : (
+            <div style={styles.aiReadyBadge}>
+              <motion.span
+                animate={{ scale: [1, 1.2, 1] }}
+                transition={{ repeat: Infinity, duration: 2 }}
+              >✓</motion.span>
+              AI Ready
+            </div>
           )}
-          <div style={styles.aiStatus}>
+
+          {/* System Status */}
+          <div style={styles.systemStatus}>
             <motion.div
               style={{
                 ...styles.statusDot,
@@ -1282,12 +1654,17 @@ REFERENCES
               animate={appState === 'streaming' ? { scale: [1, 1.5, 1] } : {}}
               transition={{ repeat: Infinity, duration: 0.8 }}
             />
-            <span style={styles.statusLabel}>
-              {appState === 'ready' ? 'Ready' :
-               appState === 'thinking' ? 'Thinking...' :
-               appState === 'streaming' ? 'Generating...' :
-               appState === 'processing' ? 'Processing...' : 'Loading'}
-            </span>
+            <div style={styles.statusInfo}>
+              <span style={styles.statusLabel}>
+                {appState === 'ready' ? 'Ready' :
+                 appState === 'thinking' ? 'Analyzing...' :
+                 appState === 'streaming' ? 'Generating...' :
+                 appState === 'processing' ? 'Processing...' : 'Loading'}
+              </span>
+              <span style={styles.statusSub}>
+                {isUsingWebGPU() ? 'WebGPU' : 'CPU'}
+              </span>
+            </div>
           </div>
         </div>
       </header>
@@ -1331,6 +1708,9 @@ REFERENCES
                       setSmartSuggestions([]);
                       setDocStats(null);
                       setDocumentAnalysis(null);
+                      setSemanticState('idle');
+                      setSemanticProgress(0);
+                      setAppState('welcome');
                       DocumentAnalyzer.clearCache(); // Clear analyzer cache
                     }}
                     style={styles.closeBtn}
@@ -1341,7 +1721,16 @@ REFERENCES
               </div>
 
               <div style={styles.docViewer} onMouseUp={handleTextSelection}>
-                {pdfText.split('\n\n').map((para, i) => (
+                <div style={styles.previewCard}>
+                  <span style={styles.previewBadge}>Fast Preview</span>
+                  <p style={styles.previewTitle}>Rendering a lightweight document view to keep scrolling and answers snappy.</p>
+                  <p style={styles.previewMeta}>
+                    {documentPreview.hiddenCount > 0
+                      ? `Showing the first ${documentPreview.paragraphs.length} sections while the full text remains indexed for Q&A.`
+                      : 'Showing the full extracted text from your document.'}
+                  </p>
+                </div>
+                {documentPreview.paragraphs.map((para, i) => (
                   <p key={i} style={styles.paragraph}>{para}</p>
                 ))}
               </div>
@@ -1372,8 +1761,8 @@ REFERENCES
                   </svg>
                 </div>
 
-                <h3 style={styles.dropzoneTitle}>Drop your PDF here</h3>
-                <p style={styles.dropzoneSubtitle}>or click to browse files</p>
+                <h3 style={styles.dropzoneTitle}>Drop a document into the workspace</h3>
+                <p style={styles.dropzoneSubtitle}>Upload once, then get grounded local answers with premium-speed retrieval.</p>
 
                 <div style={styles.features}>
                   <span>⚡ Instant analysis</span>
@@ -1395,16 +1784,16 @@ REFERENCES
               {showGuide && (
                 <div style={styles.guide}>
                   <div style={styles.guideHeader}>
-                    <span>Demo Flow</span>
+                    <span>Premium Flow</span>
                     <button onClick={() => setShowGuide(false)} style={styles.guideClose}>×</button>
                   </div>
                   <div style={styles.guideSteps}>
                     {[
-                      { title: 'Load Document', desc: 'Drop PDF or click demo' },
-                      { title: 'Ask Questions', desc: 'Type or use suggestions' },
-                      { title: 'Highlight Text', desc: 'Select for instant actions' },
-                      { title: 'Try Voice', desc: 'Push-to-talk input' },
-                      { title: 'Go Offline', desc: 'Disable WiFi - still works!' },
+                      { title: 'Load Fast', desc: 'Background extraction without UI blocking' },
+                      { title: 'Ask Instantly', desc: 'Answers are grounded from retrieved document sections' },
+                      { title: 'Warm the Model', desc: 'The compact local model loads quietly in the background' },
+                      { title: 'Highlight Context', desc: 'Select passages for quick actions' },
+                      { title: 'Stay Offline', desc: 'Everything continues locally' },
                     ].map((step, i) => (
                       <div
                         key={i}
@@ -1438,7 +1827,7 @@ REFERENCES
           {/* MODE SELECTOR */}
           {currentDocument && (
             <div style={styles.modeSelector}>
-              <span style={styles.modeLabel}>Response Style:</span>
+              <span style={styles.modeLabel}>Answer Style</span>
               {(['simple', 'detailed', 'exam'] as ExplainMode[]).map(mode => (
                 <motion.button
                   key={mode}
@@ -1461,14 +1850,14 @@ REFERENCES
             {messages.length === 0 ? (
               <div style={styles.emptyState}>
                 <div style={styles.emptyIcon}>📚</div>
-                <h2 style={styles.emptyTitle}>AI Research Assistant</h2>
+                <h2 style={styles.emptyTitle}>Grounded local document intelligence</h2>
                 <p style={styles.emptyDesc}>
-                  Upload a document to start asking questions. All AI processing happens locally on your device.
+                  Upload a PDF and ask normally. Responses are grounded from retrieved sections of your document, with the local model warming quietly in the background.
                 </p>
 
                 {currentDocument && (
                   <div style={styles.quickActions}>
-                    <p style={styles.quickLabel}>Quick start:</p>
+                    <p style={styles.quickLabel}>Try one of these:</p>
                     {[
                       'Summarize the key findings',
                       'What is the methodology?',
@@ -1501,7 +1890,7 @@ REFERENCES
                     <div style={styles.messageHeader}>
                       <span style={{
                         ...styles.messageRole,
-                        color: msg.role === 'user' ? '#6366f1' : '#10b981'
+                        color: msg.role === 'user' ? '#ffca7a' : '#8cd3bc'
                       }}>
                         {msg.role === 'user' ? 'You' : 'AI'}
                       </span>
@@ -1528,7 +1917,7 @@ REFERENCES
                     animate={{ opacity: 1, y: 0 }}
                   >
                     <div style={styles.messageHeader}>
-                      <span style={{ ...styles.messageRole, color: '#10b981' }}>AI</span>
+                      <span style={{ ...styles.messageRole, color: '#8cd3bc' }}>AI</span>
                       <span className="status-transition" style={{ fontSize: 11, color: '#888' }}>
                         {statusMessage || 'Thinking...'}
                       </span>
@@ -1640,7 +2029,7 @@ REFERENCES
               <textarea
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
-                placeholder={currentDocument ? "Ask anything about your document..." : "Upload a document to start..."}
+                placeholder={currentDocument ? "Ask about findings, methods, terms, or conclusions..." : "Upload a document to unlock fast local analysis..."}
                 disabled={!currentDocument || appState === 'thinking' || appState === 'streaming'}
                 style={styles.input}
                 rows={1}
@@ -1682,7 +2071,7 @@ REFERENCES
             </div>
 
             <div style={styles.inputHints}>
-              <span>Press Enter to send</span>
+              <span>Enter sends • Shift+Enter adds a line</span>
               <span>🔒 All processing is local</span>
             </div>
           </div>
@@ -1742,618 +2131,993 @@ REFERENCES
 }
 
 // ============================================================================
-// STYLES
+// PREMIUM STYLES - Inspired by Linear, Notion, Arc Browser
 // ============================================================================
 
 const styles: Record<string, React.CSSProperties> = {
-  // Loading screen
+  // Loading screen - Premium animated
   loadingScreen: {
     height: '100vh',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    background: 'linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%)',
+    background: 'radial-gradient(circle at top, rgba(44,180,146,0.18) 0%, transparent 34%), radial-gradient(circle at 80% 20%, rgba(255,176,78,0.16) 0%, transparent 28%), linear-gradient(180deg, #08110f 0%, #050809 56%, #020303 100%)',
+    position: 'relative' as const,
+    overflow: 'hidden',
   },
   loadingContent: {
     textAlign: 'center',
-    maxWidth: 400,
+    maxWidth: 420,
+    zIndex: 10,
   },
   loadingLogo: {
-    width: 80,
-    height: 80,
-    margin: '0 auto 24px',
-    border: '3px solid #6366f1',
-    borderRadius: '50%',
+    width: 88,
+    height: 88,
+    margin: '0 auto 28px',
+    background: 'linear-gradient(145deg, #2cb492 0%, #ffb04e 100%)',
+    borderRadius: 24,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
+    boxShadow: '0 20px 60px rgba(44,180,146,0.28), 0 0 100px rgba(255,176,78,0.12)',
   },
   logoInner: {
-    fontSize: 24,
+    fontSize: 28,
     fontWeight: 800,
-    color: '#6366f1',
+    color: '#fff',
+    textShadow: '0 2px 10px rgba(0,0,0,0.3)',
   },
   loadingTitle: {
-    fontSize: 28,
-    fontWeight: 700,
-    color: '#fff',
-    margin: '0 0 8px',
-    fontFamily: 'Inter, system-ui, sans-serif',
+    fontSize: 32,
+    fontWeight: 400,
+    background: 'linear-gradient(135deg, #fff7eb 0%, #ffd79a 48%, #8cd3bc 100%)',
+    WebkitBackgroundClip: 'text',
+    WebkitTextFillColor: 'transparent',
+    margin: '0 0 12px',
+    fontFamily: '"Instrument Serif", Georgia, serif',
+    letterSpacing: '-0.03em',
   },
   loadingStatus: {
-    fontSize: 14,
-    color: '#888',
-    margin: '0 0 24px',
+    fontSize: 15,
+    color: 'rgba(255,255,255,0.6)',
+    margin: '0 0 28px',
+    fontWeight: 500,
   },
   progressBar: {
-    height: 4,
-    background: 'rgba(255,255,255,0.1)',
-    borderRadius: 2,
+    height: 6,
+    background: 'rgba(255,255,255,0.08)',
+    borderRadius: 3,
     overflow: 'hidden',
-    marginBottom: 16,
+    marginBottom: 20,
+    boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.3)',
   },
   progressFill: {
     height: '100%',
-    background: 'linear-gradient(90deg, #6366f1, #a855f7)',
-    borderRadius: 2,
+    background: 'linear-gradient(90deg, #667eea, #764ba2, #f093fb)',
+    borderRadius: 3,
+    boxShadow: '0 0 20px rgba(102, 126, 234, 0.5)',
   },
   loadingHint: {
-    fontSize: 12,
-    color: '#666',
+    fontSize: 13,
+    color: 'rgba(255,255,255,0.4)',
+    fontWeight: 500,
+    letterSpacing: '0.02em',
   },
 
-  // Container
+  welcomeScreen: {
+    minHeight: '100vh',
+    display: 'flex',
+    alignItems: 'stretch',
+    justifyContent: 'center',
+    padding: '32px',
+    background: 'radial-gradient(circle at top, rgba(44,180,146,0.16) 0%, transparent 30%), radial-gradient(circle at 85% 18%, rgba(255,176,78,0.14) 0%, transparent 24%), linear-gradient(180deg, #08110f 0%, #050809 58%, #020303 100%)',
+  },
+  welcomeShell: {
+    width: '100%',
+    maxWidth: 1240,
+    display: 'grid',
+    gridTemplateColumns: '1.25fr 0.85fr',
+    gap: 24,
+    alignItems: 'stretch',
+  },
+  welcomeHero: {
+    padding: '56px 56px 48px',
+    borderRadius: 32,
+    background: 'linear-gradient(145deg, rgba(10,21,18,0.96), rgba(8,14,12,0.9))',
+    border: '1px solid rgba(255,255,255,0.06)',
+    boxShadow: '0 24px 80px rgba(0,0,0,0.42)',
+    display: 'flex',
+    flexDirection: 'column',
+    justifyContent: 'center',
+  },
+  welcomeEyebrow: {
+    fontSize: 12,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    color: '#8cd3bc',
+    marginBottom: 18,
+    fontWeight: 700,
+  },
+  welcomeTitle: {
+    fontFamily: '"Instrument Serif", Georgia, serif',
+    fontSize: 'clamp(3rem, 6vw, 5.4rem)',
+    lineHeight: 0.94,
+    letterSpacing: '-0.05em',
+    color: '#fff7eb',
+    marginBottom: 18,
+    fontWeight: 400,
+    maxWidth: 760,
+  },
+  welcomeCopy: {
+    fontSize: 18,
+    lineHeight: 1.75,
+    color: 'rgba(244,239,230,0.76)',
+    maxWidth: 720,
+    marginBottom: 28,
+  },
+  welcomeActions: {
+    display: 'flex',
+    gap: 14,
+    flexWrap: 'wrap' as const,
+  },
+  welcomePrimary: {
+    padding: '16px 26px',
+    borderRadius: 16,
+    border: 'none',
+    background: 'linear-gradient(145deg, #2cb492, #ffb04e)',
+    color: '#04100d',
+    fontSize: 15,
+    fontWeight: 700,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+    boxShadow: '0 14px 34px rgba(44,180,146,0.24)',
+  },
+  welcomeSecondary: {
+    padding: '16px 26px',
+    borderRadius: 16,
+    border: '1px solid rgba(255,255,255,0.08)',
+    background: 'rgba(255,255,255,0.03)',
+    color: '#fff7eb',
+    fontSize: 15,
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+  welcomeRail: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 18,
+  },
+  welcomeCardLarge: {
+    padding: '28px 28px 24px',
+    borderRadius: 28,
+    border: '1px solid rgba(255,255,255,0.06)',
+    background: 'linear-gradient(145deg, rgba(11,19,17,0.96), rgba(9,13,12,0.88))',
+    boxShadow: '0 20px 60px rgba(0,0,0,0.34)',
+  },
+  welcomeMetricRow: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+    gap: 16,
+    marginTop: 18,
+  },
+  welcomeMetricValue: {
+    fontSize: 28,
+    lineHeight: 1,
+    color: '#fff7eb',
+    fontWeight: 700,
+    marginBottom: 8,
+  },
+  welcomeMetricText: {
+    fontSize: 12,
+    color: 'rgba(244,239,230,0.6)',
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.08em',
+  },
+  welcomeCard: {
+    padding: '22px 24px',
+    borderRadius: 24,
+    border: '1px solid rgba(255,255,255,0.06)',
+    background: 'rgba(255,255,255,0.03)',
+  },
+  welcomeCardLabel: {
+    fontSize: 11,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.12em',
+    color: '#ffca7a',
+    marginBottom: 10,
+    fontWeight: 700,
+  },
+  welcomeCardText: {
+    fontSize: 15,
+    lineHeight: 1.65,
+    color: 'rgba(244,239,230,0.72)',
+  },
+
+  // Container - Rich dark theme
   container: {
     height: '100vh',
     display: 'flex',
     flexDirection: 'column',
-    background: '#0a0a0f',
-    color: '#fff',
-    fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, sans-serif',
+    background: 'radial-gradient(circle at top, rgba(44,180,146,0.12) 0%, transparent 22%), linear-gradient(180deg, #09110f 0%, #060808 100%)',
+    color: '#fff7eb',
+    fontFamily: '"Space Grotesk", -apple-system, BlinkMacSystemFont, sans-serif',
+    position: 'relative' as const,
   },
 
-  // Header
+  // Header - Glassmorphism
   header: {
-    height: 60,
+    height: 68,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: '0 24px',
-    background: 'rgba(20, 20, 30, 0.8)',
-    backdropFilter: 'blur(10px)',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    padding: '0 32px',
+    background: 'linear-gradient(180deg, rgba(9,17,15,0.94) 0%, rgba(7,10,9,0.88) 100%)',
+    backdropFilter: 'blur(24px) saturate(180%)',
+    borderBottom: '1px solid rgba(255,244,230,0.06)',
+    boxShadow: '0 4px 30px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05)',
   },
-  headerLeft: { display: 'flex', alignItems: 'center', gap: 16 },
+  headerLeft: { display: 'flex', alignItems: 'center', gap: 18 },
   headerCenter: { display: 'flex', alignItems: 'center', gap: 12 },
-  headerRight: { display: 'flex', alignItems: 'center', gap: 16 },
-  logo: { display: 'flex', alignItems: 'center', gap: 12 },
+  headerRight: { display: 'flex', alignItems: 'center', gap: 14 },
+  logo: { display: 'flex', alignItems: 'center', gap: 14 },
   logoIcon: {
-    width: 36,
-    height: 36,
-    background: 'linear-gradient(135deg, #6366f1, #a855f7)',
-    borderRadius: 10,
+    width: 44,
+    height: 44,
+    background: 'linear-gradient(145deg, #2cb492 0%, #ffb04e 100%)',
+    borderRadius: 14,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: 800,
+    color: '#fff',
+    boxShadow: '0 8px 24px rgba(44,180,146,0.22), inset 0 1px 0 rgba(255,255,255,0.2)',
   },
-  logoText: { fontSize: 18, fontWeight: 600 },
+  logoText: {
+    fontSize: 20,
+    fontWeight: 500,
+    background: 'linear-gradient(135deg, #fff7eb 0%, #ffd79a 100%)',
+    WebkitBackgroundClip: 'text',
+    WebkitTextFillColor: 'transparent',
+    letterSpacing: '-0.02em',
+    fontFamily: '"Instrument Serif", Georgia, serif',
+  },
+  logoSubtext: {
+    fontSize: 11,
+    color: 'rgba(255,255,255,0.4)',
+    fontWeight: 500,
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase' as const,
+    marginTop: 2,
+  },
 
-  // Badges
+  // Mode Indicator - Pill style
+  modeIndicator: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 18px',
+    borderRadius: 100,
+    border: '1px solid',
+    minWidth: 200,
+    backdropFilter: 'blur(12px)',
+  },
+  modeDot: {
+    width: 10,
+    height: 10,
+    borderRadius: '50%',
+    flexShrink: 0,
+    boxShadow: '0 0 12px currentColor',
+  },
+  modeContent: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  modeText: {
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: '-0.01em',
+  },
+  modeSubLabel: {
+    fontSize: 10,
+    color: 'rgba(255,255,255,0.45)',
+    fontWeight: 500,
+    marginTop: 2,
+  },
+
+  // Init Button - Gradient glow
+  initButton: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 20px',
+    background: 'linear-gradient(135deg, rgba(102,126,234,0.2) 0%, rgba(118,75,162,0.15) 100%)',
+    border: '1px solid rgba(102,126,234,0.4)',
+    borderRadius: 12,
+    color: '#a5b4fc',
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: 'pointer',
+    transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
+    boxShadow: '0 4px 16px rgba(102, 126, 234, 0.15)',
+  },
+  initIcon: {
+    fontSize: 16,
+  },
+  miniSpinner: {
+    width: 16,
+    height: 16,
+    border: '2px solid rgba(102,126,234,0.25)',
+    borderTopColor: '#667eea',
+    borderRadius: '50%',
+  },
+  aiReadyBadge: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '10px 18px',
+    background: 'linear-gradient(135deg, rgba(52,211,153,0.15) 0%, rgba(16,185,129,0.1) 100%)',
+    border: '1px solid rgba(52,211,153,0.35)',
+    borderRadius: 12,
+    color: '#34d399',
+    fontSize: 13,
+    fontWeight: 600,
+    boxShadow: '0 4px 16px rgba(52, 211, 153, 0.1)',
+  },
+
+  // System Status - Minimal
+  systemStatus: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '8px 14px',
+    background: 'rgba(255,255,255,0.04)',
+    borderRadius: 10,
+    border: '1px solid rgba(255,255,255,0.06)',
+  },
+  statusInfo: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  statusSub: {
+    fontSize: 10,
+    color: 'rgba(255,255,255,0.4)',
+    fontWeight: 600,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.05em',
+  },
+
+  // Badges - Refined
   badge: {
     display: 'flex',
     alignItems: 'center',
-    gap: 6,
-    padding: '6px 14px',
-    borderRadius: 20,
+    gap: 7,
+    padding: '8px 16px',
+    borderRadius: 100,
     fontSize: 12,
-    fontWeight: 500,
-    border: '1px solid rgba(255,255,255,0.1)',
-    background: 'rgba(255,255,255,0.03)',
+    fontWeight: 600,
+    border: '1px solid rgba(255,255,255,0.08)',
+    background: 'rgba(255,255,255,0.04)',
+    backdropFilter: 'blur(8px)',
   },
   badgeDot: {
-    width: 6,
-    height: 6,
+    width: 7,
+    height: 7,
     borderRadius: '50%',
     background: 'currentColor',
+    boxShadow: '0 0 8px currentColor',
   },
-  badgeOnline: { color: '#10b981', borderColor: '#10b981' },
-  badgeOffline: { color: '#f59e0b', borderColor: '#f59e0b', background: 'rgba(245,158,11,0.1)' },
-  badgeOfflineReady: { color: '#10b981', borderColor: '#10b981', background: 'rgba(16,185,129,0.15)', fontWeight: 600 },
-  badgePrivacy: { color: '#6366f1', borderColor: '#6366f1', background: 'rgba(99,102,241,0.1)' },
-  badgeDemo: { color: '#a855f7', borderColor: '#a855f7', background: 'rgba(168,85,247,0.1)', fontWeight: 700 },
+  badgeOnline: { color: '#34d399', borderColor: 'rgba(52,211,153,0.3)' },
+  badgeOffline: { color: '#fbbf24', borderColor: 'rgba(251,191,36,0.3)', background: 'rgba(251,191,36,0.08)' },
+  badgeOfflineReady: { color: '#34d399', borderColor: 'rgba(52,211,153,0.3)', background: 'rgba(52,211,153,0.1)' },
+  badgePrivacy: { color: '#818cf8', borderColor: 'rgba(129,140,248,0.3)', background: 'rgba(129,140,248,0.08)' },
+  badgeDemo: { color: '#c084fc', borderColor: 'rgba(192,132,252,0.3)', background: 'rgba(192,132,252,0.1)' },
 
   // AI Status
   aiStatus: { display: 'flex', alignItems: 'center', gap: 8 },
-  statusDot: { width: 8, height: 8, borderRadius: '50%' },
-  statusLabel: { fontSize: 12, color: '#888', textTransform: 'uppercase' as const, letterSpacing: 0.5 },
+  statusDot: {
+    width: 10,
+    height: 10,
+    borderRadius: '50%',
+    boxShadow: '0 0 12px currentColor, 0 0 24px currentColor',
+  },
+  statusLabel: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.7)',
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+  },
 
   // Main layout
   main: {
     flex: 1,
     display: 'grid',
-    gridTemplateColumns: '1fr 1fr',
+    gridTemplateColumns: 'minmax(0, 1.06fr) minmax(0, 0.94fr)',
+    gap: 20,
     overflow: 'hidden',
+    padding: '20px 24px 24px',
+    background: 'transparent',
   },
 
-  // Document panel
+  // Document panel - Refined
   documentPanel: {
-    background: 'rgba(15, 15, 20, 0.6)',
-    borderRight: '1px solid rgba(255,255,255,0.06)',
+    background: 'linear-gradient(180deg, rgba(13, 22, 20, 0.88) 0%, rgba(7, 11, 10, 0.96) 100%)',
+    border: '1px solid rgba(255,244,230,0.08)',
+    borderRadius: 30,
     display: 'flex',
     flexDirection: 'column',
     overflow: 'hidden',
+    boxShadow: '0 18px 60px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.04)',
+    backdropFilter: 'blur(18px)',
   },
   docHeader: {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: '12px 20px',
-    background: 'rgba(25, 25, 35, 0.8)',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    padding: '18px 24px',
+    background: 'linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 100%)',
+    borderBottom: '1px solid rgba(255,244,230,0.06)',
+    backdropFilter: 'blur(18px)',
   },
-  docInfo: { display: 'flex', alignItems: 'center', gap: 12 },
-  docIcon: { fontSize: 24 },
-  docName: { fontSize: 14, fontWeight: 500 },
-  docMeta: { fontSize: 11, color: '#666', marginTop: 2 },
+  docInfo: { display: 'flex', alignItems: 'center', gap: 14 },
+  docIcon: { fontSize: 28 },
+  docName: { fontSize: 17, fontWeight: 500, color: '#fff7eb', fontFamily: '"Instrument Serif", Georgia, serif' },
+  docMeta: { fontSize: 12, color: 'rgba(244,239,230,0.5)', marginTop: 3, fontWeight: 500 },
   closeBtn: {
-    padding: '6px 14px',
-    background: 'transparent',
-    border: '1px solid rgba(255,255,255,0.1)',
-    color: '#888',
-    fontSize: 12,
-    borderRadius: 6,
+    padding: '8px 16px',
+    background: 'rgba(255,255,255,0.04)',
+    border: '1px solid rgba(255,255,255,0.07)',
+    color: 'rgba(244,239,230,0.68)',
+    fontSize: 13,
+    fontWeight: 500,
+    borderRadius: 8,
     cursor: 'pointer',
+    transition: 'all 0.2s',
   },
   docViewer: {
     flex: 1,
     overflowY: 'auto' as const,
-    padding: 24,
+    padding: '28px 28px 36px',
+  },
+  previewCard: {
+    marginBottom: 22,
+    padding: '18px 20px',
+    borderRadius: 18,
+    border: '1px solid rgba(255,176,78,0.18)',
+    background: 'linear-gradient(135deg, rgba(255,176,78,0.08), rgba(44,180,146,0.08))',
+    boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.04)',
+  },
+  previewBadge: {
+    display: 'inline-flex',
+    padding: '6px 10px',
+    borderRadius: 999,
+    background: 'rgba(255,176,78,0.12)',
+    color: '#ffca7a',
+    fontSize: 11,
+    fontWeight: 700,
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase' as const,
+    marginBottom: 12,
+  },
+  previewTitle: {
+    fontSize: 16,
+    lineHeight: 1.5,
+    color: '#f4efe6',
+    marginBottom: 6,
+    fontWeight: 600,
+  },
+  previewMeta: {
+    fontSize: 13,
+    lineHeight: 1.6,
+    color: 'rgba(244,239,230,0.65)',
   },
   paragraph: {
-    fontSize: 14,
-    lineHeight: 1.7,
-    color: '#aaa',
-    marginBottom: 16,
+    fontSize: 15,
+    lineHeight: 1.82,
+    color: 'rgba(244,239,230,0.78)',
+    marginBottom: 18,
     userSelect: 'text' as const,
   },
 
-  // Upload area
+  // Upload area - Premium
   uploadArea: {
     flex: 1,
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 32,
-    gap: 24,
+    padding: 44,
+    gap: 28,
   },
   dropzone: {
     width: '100%',
-    maxWidth: 420,
-    padding: '48px 32px',
-    border: '2px dashed rgba(255,255,255,0.15)',
-    borderRadius: 16,
+    maxWidth: 480,
+    padding: '56px 40px',
+    border: '1px dashed rgba(255,176,78,0.32)',
+    borderRadius: 28,
     textAlign: 'center' as const,
     cursor: 'pointer',
-    background: 'rgba(25,25,35,0.5)',
-    transition: 'all 0.2s',
+    background: 'linear-gradient(135deg, rgba(44,180,146,0.08) 0%, rgba(255,176,78,0.07) 100%)',
+    transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+    boxShadow: '0 18px 42px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05)',
   },
   dropzoneDragging: {
-    borderColor: '#6366f1',
-    background: 'rgba(99,102,241,0.1)',
+    borderColor: '#ffb04e',
+    background: 'linear-gradient(135deg, rgba(44,180,146,0.14) 0%, rgba(255,176,78,0.12) 100%)',
+    boxShadow: '0 18px 54px rgba(255,176,78,0.16), inset 0 1px 0 rgba(255,255,255,0.1)',
+    transform: 'scale(1.02)',
   },
-  dropzoneIcon: { color: '#666', marginBottom: 16 },
-  dropzoneTitle: { fontSize: 20, fontWeight: 600, margin: '0 0 4px' },
-  dropzoneSubtitle: { fontSize: 14, color: '#666', margin: '0 0 24px' },
+  dropzoneIcon: { color: 'rgba(255,255,255,0.5)', marginBottom: 20 },
+  dropzoneTitle: { fontSize: 22, fontWeight: 700, margin: '0 0 8px', color: '#fff' },
+  dropzoneSubtitle: { fontSize: 15, color: 'rgba(255,255,255,0.45)', margin: '0 0 28px', fontWeight: 500 },
   features: {
     display: 'flex',
-    gap: 16,
+    gap: 20,
     justifyContent: 'center',
-    fontSize: 12,
-    color: '#888',
+    fontSize: 13,
+    color: 'rgba(255,255,255,0.5)',
+    fontWeight: 500,
   },
   demoButton: {
     display: 'flex',
     alignItems: 'center',
-    gap: 8,
-    padding: '14px 28px',
-    background: 'linear-gradient(135deg, #6366f1, #a855f7)',
+    gap: 10,
+    padding: '16px 32px',
+    background: 'linear-gradient(135deg, #2cb492 0%, #ffb04e 100%)',
     border: 'none',
-    borderRadius: 10,
-    color: '#fff',
-    fontSize: 15,
+    borderRadius: 16,
+    color: '#04100d',
+    fontSize: 16,
     fontWeight: 600,
     cursor: 'pointer',
-    boxShadow: '0 4px 20px rgba(99,102,241,0.3)',
+    boxShadow: '0 12px 32px rgba(44,180,146,0.22), inset 0 1px 0 rgba(255,255,255,0.24)',
+    transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
   },
 
-  // Guide
+  // Guide - Card style
   guide: {
     width: '100%',
-    maxWidth: 420,
-    background: 'rgba(25,25,35,0.8)',
-    border: '1px solid rgba(255,255,255,0.08)',
-    borderRadius: 12,
+    maxWidth: 480,
+    background: 'linear-gradient(135deg, rgba(25,25,40,0.9) 0%, rgba(20,20,32,0.95) 100%)',
+    border: '1px solid rgba(255,255,255,0.06)',
+    borderRadius: 16,
     overflow: 'hidden',
+    boxShadow: '0 8px 32px rgba(0,0,0,0.3)',
   },
   guideHeader: {
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'center',
-    padding: '12px 16px',
-    background: 'rgba(255,255,255,0.02)',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
-    fontSize: 13,
+    padding: '14px 20px',
+    background: 'rgba(255,255,255,0.03)',
+    borderBottom: '1px solid rgba(255,255,255,0.05)',
+    fontSize: 14,
     fontWeight: 600,
+    color: 'rgba(255,255,255,0.8)',
   },
   guideClose: {
     background: 'none',
     border: 'none',
-    color: '#666',
-    fontSize: 20,
+    color: 'rgba(255,255,255,0.4)',
+    fontSize: 22,
     cursor: 'pointer',
     lineHeight: 1,
+    transition: 'color 0.2s',
   },
-  guideSteps: { padding: 12 },
+  guideSteps: { padding: 16 },
   step: {
     display: 'flex',
-    gap: 12,
-    padding: 10,
-    borderRadius: 8,
+    gap: 14,
+    padding: 12,
+    borderRadius: 10,
+    transition: 'background 0.2s',
   },
-  stepCurrent: { background: 'rgba(99,102,241,0.1)' },
+  stepCurrent: { background: 'rgba(102,126,234,0.12)' },
   stepDone: {},
   stepNum: {
-    width: 24,
-    height: 24,
+    width: 28,
+    height: 28,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    background: 'rgba(255,255,255,0.05)',
-    border: '1px solid rgba(255,255,255,0.1)',
+    background: 'rgba(255,255,255,0.06)',
+    border: '1px solid rgba(255,255,255,0.08)',
     borderRadius: '50%',
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: 600,
     flexShrink: 0,
+    color: 'rgba(255,255,255,0.6)',
   },
-  stepTitle: { fontSize: 13, fontWeight: 500 },
-  stepDesc: { fontSize: 11, color: '#666' },
+  stepTitle: { fontSize: 14, fontWeight: 600, color: '#fff' },
+  stepDesc: { fontSize: 12, color: 'rgba(255,255,255,0.45)', marginTop: 2 },
 
-  // Chat panel
+  // Chat panel - Clean
   chatPanel: {
     display: 'flex',
     flexDirection: 'column',
     overflow: 'hidden',
-    background: '#0a0a0f',
+    background: 'linear-gradient(180deg, rgba(13, 22, 20, 0.88) 0%, rgba(7, 11, 10, 0.96) 100%)',
+    border: '1px solid rgba(255,244,230,0.08)',
+    borderRadius: 30,
+    boxShadow: '0 18px 60px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.04)',
+    backdropFilter: 'blur(18px)',
   },
 
-  // Mode selector
+  // Mode selector - Tabs
   modeSelector: {
     display: 'flex',
     alignItems: 'center',
     gap: 8,
-    padding: '10px 20px',
-    background: 'rgba(20,20,30,0.6)',
-    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    padding: '18px 22px 14px',
+    background: 'linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 100%)',
+    borderBottom: '1px solid rgba(255,244,230,0.06)',
   },
-  modeLabel: { fontSize: 12, color: '#666', marginRight: 8 },
+  modeLabel: { fontSize: 13, color: 'rgba(244,239,230,0.45)', marginRight: 12, fontWeight: 500 },
   modeBtn: {
-    padding: '6px 14px',
-    background: 'transparent',
-    border: '1px solid rgba(255,255,255,0.1)',
-    color: '#888',
-    fontSize: 12,
-    borderRadius: 6,
+    padding: '8px 16px',
+    background: 'rgba(255,255,255,0.03)',
+    border: '1px solid rgba(255,255,255,0.05)',
+    color: 'rgba(244,239,230,0.62)',
+    fontSize: 13,
+    fontWeight: 500,
+    borderRadius: 8,
     cursor: 'pointer',
-    transition: 'all 0.15s',
+    transition: 'all 0.2s',
   },
   modeBtnActive: {
-    background: '#6366f1',
-    borderColor: '#6366f1',
-    color: '#fff',
+    background: 'linear-gradient(145deg, #2cb492 0%, #ffb04e 100%)',
+    borderColor: 'transparent',
+    color: '#04100d',
+    boxShadow: '0 8px 22px rgba(44,180,146,0.22)',
   },
 
-  // Messages
+  // Messages - Clean cards
   messagesArea: {
     flex: 1,
     overflowY: 'auto' as const,
-    padding: 24,
+    padding: '28px 26px 20px',
   },
   emptyState: {
     textAlign: 'center' as const,
-    padding: '60px 20px',
-    maxWidth: 460,
+    padding: '72px 24px',
+    maxWidth: 500,
     margin: '0 auto',
   },
-  emptyIcon: { fontSize: 56, marginBottom: 16, opacity: 0.5 },
-  emptyTitle: { fontSize: 24, fontWeight: 600, margin: '0 0 8px' },
-  emptyDesc: { fontSize: 14, color: '#888', lineHeight: 1.6, margin: '0 0 32px' },
-  quickActions: { display: 'flex', flexDirection: 'column' as const, gap: 8 },
-  quickLabel: { fontSize: 12, color: '#666', margin: '0 0 8px' },
+  emptyIcon: { fontSize: 64, marginBottom: 20, opacity: 0.6 },
+  emptyTitle: { fontSize: 34, fontWeight: 500, margin: '0 0 12px', color: '#fff7eb', fontFamily: '"Instrument Serif", Georgia, serif' },
+  emptyDesc: { fontSize: 15, color: 'rgba(244,239,230,0.55)', lineHeight: 1.7, margin: '0 0 36px', fontWeight: 500 },
+  quickActions: { display: 'flex', flexDirection: 'column' as const, gap: 10 },
+  quickLabel: { fontSize: 13, color: 'rgba(244,239,230,0.42)', margin: '0 0 10px', fontWeight: 500 },
   quickBtn: {
     width: '100%',
-    padding: '14px 18px',
-    background: 'rgba(25,25,35,0.6)',
-    border: '1px solid rgba(255,255,255,0.08)',
-    color: '#aaa',
-    fontSize: 14,
+    padding: '16px 20px',
+    background: 'rgba(255,255,255,0.03)',
+    border: '1px solid rgba(255,255,255,0.05)',
+    color: 'rgba(244,239,230,0.82)',
+    fontSize: 15,
+    fontWeight: 500,
     textAlign: 'left' as const,
-    borderRadius: 10,
+    borderRadius: 12,
     cursor: 'pointer',
-    transition: 'all 0.15s',
+    transition: 'all 0.2s',
   },
-  messages: { display: 'flex', flexDirection: 'column' as const, gap: 20 },
-  message: { maxWidth: '85%' },
+  messages: { display: 'flex', flexDirection: 'column' as const, gap: 24 },
+  message: { maxWidth: '92%' },
   messageUser: { alignSelf: 'flex-end' as const },
   messageAssistant: { alignSelf: 'flex-start' as const },
-  messageHeader: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 },
-  messageRole: { fontSize: 11, fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: 0.5 },
+  messageHeader: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 },
+  messageRole: { fontSize: 12, fontWeight: 700, textTransform: 'uppercase' as const, letterSpacing: '0.05em' },
   cachedBadge: {
-    fontSize: 10,
-    padding: '2px 8px',
-    background: 'rgba(99,102,241,0.15)',
-    borderRadius: 4,
-    color: '#a5b4fc',
+    fontSize: 11,
+    padding: '3px 10px',
+    background: 'rgba(44,180,146,0.14)',
+    borderRadius: 6,
+    color: '#8cd3bc',
+    fontWeight: 600,
   },
   messageContent: {
-    fontSize: 14,
-    lineHeight: 1.6,
-    padding: '14px 18px',
-    borderRadius: 14,
-    background: 'rgba(30,30,45,0.7)',
+    fontSize: 15,
+    lineHeight: 1.72,
+    padding: '18px 22px',
+    borderRadius: 20,
+    background: 'linear-gradient(145deg, rgba(18,29,26,0.94) 0%, rgba(10,16,15,0.98) 100%)',
     border: '1px solid rgba(255,255,255,0.06)',
     whiteSpace: 'pre-wrap' as const,
+    boxShadow: '0 12px 30px rgba(0,0,0,0.18)',
   },
   messageContentUser: {
-    background: 'linear-gradient(135deg, #6366f1, #7c3aed)',
+    background: 'linear-gradient(145deg, #ffca7a 0%, #f2a43f 100%)',
     border: 'none',
-    color: '#fff',
+    color: '#1e1205',
+    boxShadow: '0 12px 28px rgba(242,164,63,0.22)',
   },
-  cursor: { animation: 'blink 0.8s infinite', color: '#6366f1' },
+  cursor: { animation: 'blink 0.8s infinite', color: '#667eea' },
   thinkingDots: {
     display: 'flex',
-    gap: 6,
-    padding: '14px 18px',
+    gap: 8,
+    padding: '18px 22px',
   },
   thinkingDot: {
-    width: 8,
-    height: 8,
-    background: '#666',
+    width: 10,
+    height: 10,
+    background: 'rgba(255,255,255,0.3)',
     borderRadius: '50%',
   },
 
-  // Input area
+  // Input area - Floating style
   inputArea: {
-    padding: '16px 20px',
-    background: 'rgba(20,20,30,0.8)',
-    borderTop: '1px solid rgba(255,255,255,0.06)',
+    padding: '18px 22px 20px',
+    background: 'linear-gradient(180deg, rgba(255,255,255,0.03) 0%, rgba(8,10,10,0.88) 100%)',
+    borderTop: '1px solid rgba(255,244,230,0.06)',
   },
   voiceIndicator: {
-    padding: 12,
-    background: 'rgba(245,158,11,0.1)',
-    border: '1px solid rgba(245,158,11,0.3)',
-    borderRadius: 8,
-    marginBottom: 12,
+    padding: 16,
+    background: 'linear-gradient(135deg, rgba(251,191,36,0.1) 0%, rgba(245,158,11,0.08) 100%)',
+    border: '1px solid rgba(251,191,36,0.25)',
+    borderRadius: 12,
+    marginBottom: 14,
     textAlign: 'center' as const,
-    fontSize: 14,
-    color: '#f59e0b',
+    fontSize: 15,
+    color: '#fbbf24',
+    fontWeight: 500,
   },
-  inputRow: { display: 'flex', gap: 10 },
+  inputRow: { display: 'flex', gap: 12 },
   input: {
     flex: 1,
-    padding: '14px 18px',
-    background: 'rgba(15,15,20,0.8)',
-    border: '1px solid rgba(255,255,255,0.1)',
-    color: '#fff',
-    fontSize: 14,
-    borderRadius: 10,
+    padding: '16px 20px',
+    background: 'rgba(255,255,255,0.03)',
+    border: '1px solid rgba(255,255,255,0.07)',
+    color: '#fff7eb',
+    fontSize: 15,
+    borderRadius: 14,
     resize: 'none' as const,
     fontFamily: 'inherit',
     outline: 'none',
-    transition: 'border-color 0.15s',
+    transition: 'all 0.2s',
   },
   voiceBtn: {
-    width: 48,
-    height: 48,
+    width: 52,
+    height: 52,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    background: 'rgba(30,30,45,0.8)',
-    border: '1px solid rgba(255,255,255,0.1)',
-    color: '#aaa',
-    fontSize: 20,
-    borderRadius: 10,
+    background: 'rgba(255,255,255,0.04)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: 22,
+    borderRadius: 14,
     cursor: 'pointer',
+    transition: 'all 0.2s',
   },
   voiceBtnRecording: {
-    background: 'rgba(239,68,68,0.15)',
-    borderColor: '#ef4444',
+    background: 'linear-gradient(135deg, rgba(239,68,68,0.2) 0%, rgba(220,38,38,0.15) 100%)',
+    borderColor: 'rgba(239,68,68,0.4)',
     color: '#ef4444',
-    animation: 'pulse 1s infinite',
+    boxShadow: '0 0 24px rgba(239,68,68,0.3)',
   },
   sendBtn: {
-    width: 48,
-    height: 48,
+    width: 52,
+    height: 52,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    background: 'linear-gradient(135deg, #6366f1, #7c3aed)',
+    background: 'linear-gradient(145deg, #2cb492 0%, #ffb04e 100%)',
     border: 'none',
-    color: '#fff',
-    borderRadius: 10,
+    color: '#04100d',
+    borderRadius: 14,
     cursor: 'pointer',
+    boxShadow: '0 8px 24px rgba(44,180,146,0.24)',
+    transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
   },
   inputHints: {
     display: 'flex',
     justifyContent: 'space-between',
-    marginTop: 8,
-    fontSize: 11,
-    color: '#555',
+    marginTop: 10,
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.35)',
+    fontWeight: 500,
   },
 
-  // Suggestion chips
+  // Suggestion chips - Pills
   suggestionsRow: {
     display: 'flex',
-    gap: 8,
-    marginBottom: 12,
+    gap: 10,
+    marginBottom: 14,
     overflowX: 'auto' as const,
-    paddingBottom: 4,
+    paddingBottom: 6,
   },
   suggestionChip: {
-    padding: '8px 14px',
-    background: 'rgba(99,102,241,0.08)',
-    border: '1px solid rgba(99,102,241,0.2)',
+    padding: '10px 16px',
+    background: 'rgba(102,126,234,0.08)',
+    border: '1px solid rgba(102,126,234,0.2)',
     color: '#a5b4fc',
-    fontSize: 12,
-    borderRadius: 20,
+    fontSize: 13,
+    fontWeight: 500,
+    borderRadius: 100,
     cursor: 'pointer',
     whiteSpace: 'nowrap' as const,
-    transition: 'all 0.15s',
+    transition: 'all 0.2s',
     fontFamily: 'inherit',
   },
   voiceActionBtn: {
-    padding: '4px 12px',
-    border: '1px solid rgba(255,255,255,0.12)',
-    borderRadius: 6,
-    fontSize: 12,
-    color: '#ccc',
-    background: 'transparent',
+    padding: '6px 14px',
+    border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 500,
+    color: 'rgba(255,255,255,0.7)',
+    background: 'rgba(255,255,255,0.04)',
     cursor: 'pointer',
     fontFamily: 'inherit',
-    transition: 'all 0.15s',
+    transition: 'all 0.2s',
   } as React.CSSProperties,
 
-  // Floating actions
+  // Floating actions - Card
   floatingActions: {
     position: 'fixed' as const,
     transform: 'translate(-50%, -100%)',
     display: 'flex',
-    gap: 4,
-    padding: 6,
-    background: 'rgba(25,25,35,0.95)',
-    border: '1px solid rgba(99,102,241,0.5)',
-    borderRadius: 10,
-    boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+    gap: 6,
+    padding: 8,
+    background: 'linear-gradient(135deg, rgba(25,25,40,0.98) 0%, rgba(20,20,32,0.99) 100%)',
+    border: '1px solid rgba(102,126,234,0.3)',
+    borderRadius: 14,
+    boxShadow: '0 12px 48px rgba(0,0,0,0.5), 0 0 40px rgba(102,126,234,0.15)',
     zIndex: 1000,
+    backdropFilter: 'blur(16px)',
   },
   floatingBtn: {
-    padding: '8px 14px',
+    padding: '10px 16px',
     background: 'rgba(255,255,255,0.05)',
-    border: '1px solid rgba(255,255,255,0.1)',
-    color: '#aaa',
-    fontSize: 12,
-    borderRadius: 6,
+    border: '1px solid rgba(255,255,255,0.08)',
+    color: 'rgba(255,255,255,0.75)',
+    fontSize: 13,
+    fontWeight: 500,
+    borderRadius: 8,
     cursor: 'pointer',
     whiteSpace: 'nowrap' as const,
-    transition: 'all 0.15s',
+    transition: 'all 0.2s',
   },
 
-  // Status bar
+  // Status bar - Floating pill
   statusBar: {
     position: 'fixed' as const,
-    bottom: 24,
+    bottom: 28,
     left: '50%',
     transform: 'translateX(-50%)',
     display: 'flex',
     alignItems: 'center',
-    gap: 12,
-    padding: '12px 20px',
-    background: 'rgba(25,25,35,0.95)',
-    border: '1px solid rgba(255,255,255,0.1)',
-    borderRadius: 12,
-    boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+    gap: 14,
+    padding: '14px 24px',
+    background: 'linear-gradient(135deg, rgba(25,25,40,0.98) 0%, rgba(20,20,32,0.99) 100%)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    borderRadius: 100,
+    boxShadow: '0 12px 48px rgba(0,0,0,0.5)',
     zIndex: 1000,
-    fontSize: 13,
-    color: '#aaa',
+    fontSize: 14,
+    fontWeight: 500,
+    color: 'rgba(255,255,255,0.8)',
+    backdropFilter: 'blur(16px)',
   },
   spinner: {
-    width: 16,
-    height: 16,
+    width: 18,
+    height: 18,
     border: '2px solid rgba(255,255,255,0.1)',
-    borderTopColor: '#6366f1',
+    borderTopColor: '#667eea',
     borderRadius: '50%',
-    animation: 'spin 1s linear infinite',
+    animation: 'spin 0.8s linear infinite',
   },
 };
 
-// Global CSS animations
+// Premium Global CSS with animations
 const globalCSS = `
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@400;500;700&display=swap');
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    background: #0a0a0f;
-    color: #fff;
+    font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: linear-gradient(180deg, #09110f 0%, #060808 100%);
+    color: #fff7eb;
     overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
-  ::selection { background: rgba(99,102,241,0.3); }
+  ::selection { background: rgba(44,180,146,0.35); }
 
-  ::-webkit-scrollbar { width: 6px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+  /* Premium Scrollbar */
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
+  ::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(44,180,146,0.32) 0%, rgba(255,176,78,0.28) 100%);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, rgba(44,180,146,0.5) 0%, rgba(255,176,78,0.44) 100%);
+  }
 
+  /* Animations */
   @keyframes spin { to { transform: rotate(360deg); } }
-  @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
   @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
-  @keyframes bounce {
-    0%, 80%, 100% { transform: scale(0.6); }
-    40% { transform: scale(1); }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-8px); }
   }
 
-  /* ENHANCED: Premium skeleton loader animation */
+  @keyframes gradientShift {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+
+  @keyframes glowPulse {
+    0%, 100% { box-shadow: 0 0 20px rgba(102,126,234,0.3), 0 0 40px rgba(102,126,234,0.1); }
+    50% { box-shadow: 0 0 30px rgba(102,126,234,0.5), 0 0 60px rgba(102,126,234,0.2); }
+  }
+
+  /* Animated background for loading */
+  .loading-bg {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(circle at 20% 20%, rgba(102,126,234,0.15) 0%, transparent 50%),
+      radial-gradient(circle at 80% 80%, rgba(118,75,162,0.15) 0%, transparent 50%),
+      radial-gradient(circle at 40% 60%, rgba(240,147,251,0.1) 0%, transparent 40%);
+    animation: gradientShift 8s ease infinite;
+    background-size: 200% 200%;
+  }
+
+  /* Premium Skeleton Loader */
   @keyframes shimmer {
     0% { background-position: -200% 0; }
     100% { background-position: 200% 0; }
   }
 
   .skeleton-loader {
-    padding: 14px 18px;
-    background: rgba(30, 30, 45, 0.7);
+    padding: 18px 22px;
+    background: linear-gradient(135deg, rgba(14,24,22,0.92) 0%, rgba(11,17,16,0.95) 100%);
     border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 14px;
+    border-radius: 16px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.2);
   }
 
   .skeleton-line {
-    height: 14px;
-    margin-bottom: 10px;
-    background: linear-gradient(90deg,
-      rgba(255,255,255,0.06) 25%,
-      rgba(255,255,255,0.12) 50%,
-      rgba(255,255,255,0.06) 75%);
-    background-size: 200% 100%;
-    animation: shimmer 1.5s infinite ease-in-out;
-    border-radius: 6px;
-  }
-
-  .skeleton-line:nth-child(1) { width: 90%; }
-  .skeleton-line:nth-child(2) { width: 75%; animation-delay: 0.1s; }
-  .skeleton-line:nth-child(3) { width: 60%; margin-bottom: 0; animation-delay: 0.2s; }
-
-  /* Status transition animation */
-  .status-transition {
-    animation: fadeInOut 2s ease-in-out infinite;
-  }
-
-  @keyframes fadeInOut {
-    0%, 100% { opacity: 0.5; }
-    50% { opacity: 1; }
-  }
-
-  /* Voice transcript preview with countdown */
-  .transcript-preview {
-    padding: 14px 16px;
-    background: linear-gradient(135deg, rgba(99,102,241,0.15), rgba(168,85,247,0.1));
-    border: 1px solid rgba(99,102,241,0.4);
-    border-radius: 10px;
+    height: 16px;
     margin-bottom: 12px;
+    background: linear-gradient(90deg,
+      rgba(44,180,146,0.08) 0%,
+      rgba(255,176,78,0.14) 25%,
+      rgba(255,244,230,0.12) 50%,
+      rgba(255,176,78,0.14) 75%,
+      rgba(44,180,146,0.08) 100%);
+    background-size: 200% 100%;
+    animation: shimmer 2s infinite ease-in-out;
+    border-radius: 8px;
+  }
+
+  .skeleton-line:nth-child(1) { width: 92%; }
+  .skeleton-line:nth-child(2) { width: 78%; animation-delay: 0.15s; }
+  .skeleton-line:nth-child(3) { width: 65%; margin-bottom: 0; animation-delay: 0.3s; }
+
+  /* Status transition */
+  .status-transition {
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  /* Voice transcript preview */
+  .transcript-preview {
+    padding: 18px 20px;
+    background: linear-gradient(135deg, rgba(44,180,146,0.12) 0%, rgba(255,176,78,0.08) 100%);
+    border: 1px solid rgba(44,180,146,0.24);
+    border-radius: 14px;
+    margin-bottom: 14px;
     position: relative;
     overflow: hidden;
+    box-shadow: 0 4px 20px rgba(44,180,146,0.08);
   }
 
   .transcript-preview::after {
@@ -2361,9 +3125,10 @@ const globalCSS = `
     position: absolute;
     bottom: 0;
     left: 0;
-    height: 3px;
-    background: linear-gradient(90deg, #6366f1, #a855f7);
+    height: 4px;
+    background: linear-gradient(90deg, #2cb492, #ffb04e, #fff1c7);
     animation: countdownBar 3s linear forwards;
+    border-radius: 0 0 14px 14px;
   }
 
   @keyframes countdownBar {
@@ -2371,32 +3136,89 @@ const globalCSS = `
     to { width: 0%; }
   }
 
-  /* Markdown content styling */
-  .md-content h1, .md-content h2, .md-content h3 {
-    color: #fff;
-    margin: 12px 0 8px;
-  }
-  .md-content h1 { font-size: 18px; }
-  .md-content h2 { font-size: 16px; }
-  .md-content h3 { font-size: 14px; }
-  .md-content p { margin: 8px 0; }
-  .md-content ul { margin: 8px 0; padding-left: 20px; }
-  .md-content li { margin: 4px 0; color: #ccc; }
-  .md-content strong { color: #fff; font-weight: 600; }
-  .md-content em { color: #a5b4fc; }
-  .md-content code {
-    background: rgba(99,102,241,0.2);
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-family: 'SF Mono', Consolas, monospace;
-    font-size: 13px;
+  /* Premium Markdown Content */
+  .md-content {
+    color: rgba(255,255,255,0.85);
   }
 
+  .md-content h1, .md-content h2, .md-content h3 {
+    background: linear-gradient(135deg, #fff 0%, #c4b5fd 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin: 16px 0 10px;
+    font-weight: 700;
+  }
+  .md-content h1 { font-size: 20px; }
+  .md-content h2 { font-size: 18px; }
+  .md-content h3 { font-size: 16px; }
+  .md-content p { margin: 10px 0; line-height: 1.7; }
+  .md-content ul { margin: 10px 0; padding-left: 24px; }
+  .md-content li {
+    margin: 6px 0;
+    color: rgba(255,255,255,0.75);
+    line-height: 1.6;
+  }
+  .md-content li::marker {
+    color: #667eea;
+  }
+  .md-content strong {
+    color: #fff;
+    font-weight: 600;
+  }
+  .md-content em {
+    color: #c4b5fd;
+    font-style: italic;
+  }
+  .md-content code {
+    background: linear-gradient(135deg, rgba(102,126,234,0.15) 0%, rgba(118,75,162,0.1) 100%);
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+    font-size: 13px;
+    color: #c4b5fd;
+    border: 1px solid rgba(102,126,234,0.2);
+  }
+  .md-content hr {
+    border: none;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(102,126,234,0.3), transparent);
+    margin: 16px 0;
+  }
+
+  /* Premium thinking dots */
   .thinking-dots span {
     animation: bounce 1.4s infinite ease-in-out;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    border-radius: 50%;
   }
   .thinking-dots span:nth-child(1) { animation-delay: -0.32s; }
   .thinking-dots span:nth-child(2) { animation-delay: -0.16s; }
+
+  @keyframes bounce {
+    0%, 80%, 100% { transform: scale(0.7); opacity: 0.5; }
+    40% { transform: scale(1); opacity: 1; }
+  }
+
+  /* Input focus glow */
+  textarea:focus, input:focus {
+    border-color: rgba(102,126,234,0.5) !important;
+    box-shadow: 0 0 0 3px rgba(102,126,234,0.1), 0 4px 16px rgba(102,126,234,0.15) !important;
+  }
+
+  /* Button hover effects */
+  button:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  button:active:not(:disabled) {
+    transform: translateY(0);
+  }
+
+  /* Smooth transitions for all interactive elements */
+  button, input, textarea, a {
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
 `;
 
 export default HackathonWinner;
+

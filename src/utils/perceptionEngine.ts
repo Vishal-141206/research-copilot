@@ -7,9 +7,23 @@
  * - Smart fallbacks from document content
  */
 
-import { QueryCache } from './queryCache';
+import { QueryCache, detectCacheIntent } from './queryCache';
 import { getDemoResponse } from './demoHelpers';
 import { DocumentStore } from './documentStore';
+
+// Use the shared STOP_WORDS set from documentStore to avoid duplication
+const STOP_WORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were',
+  'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+  'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall',
+  'can', 'need', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
+  'from', 'as', 'into', 'through', 'during', 'before', 'after',
+  'above', 'below', 'between', 'under', 'again', 'further', 'then',
+  'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all',
+  'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
+  'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
+  'just', 'also', 'now', 'this', 'that', 'these', 'those', 'its'
+]);
 
 // ============================================================================
 // TYPES
@@ -39,20 +53,6 @@ const DEFAULT_CONFIG: PerceptionConfig = {
   maxInstantLatencyMs: 200,
   showConfidenceIndicator: false,
 };
-
-// Filler words to remove for compression
-const FILLER_WORDS = new Set([
-  'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were',
-  'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
-  'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall',
-  'can', 'need', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
-  'from', 'as', 'into', 'through', 'during', 'before', 'after',
-  'above', 'below', 'between', 'under', 'again', 'further', 'then',
-  'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all',
-  'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
-  'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
-  'just', 'also', 'now', 'this', 'that', 'these', 'those', 'its'
-]);
 
 // Intent patterns for fuzzy matching
 const INTENT_PATTERNS: Array<{ keywords: string[]; intent: string; template: string }> = [
@@ -291,56 +291,64 @@ class PerceptionEngineClass {
   ): Promise<InstantResponse> {
     const start = performance.now();
     const normalizedQuery = query.toLowerCase().trim();
+    const cacheIntent = detectCacheIntent(query);
 
-    // 0. Check DEMO PERFECT QUERIES first (highest priority for demos)
-    const perfectMatch = this.findPerfectQuery(normalizedQuery);
-    if (perfectMatch) {
-      console.log(`[Perception] Perfect demo query match in ${performance.now() - start}ms`);
-      return {
-        text: perfectMatch,
-        source: 'demo',
-        confidence: 1.0,
-        canRefine: false
-      };
+    // 0. Check exact demo cache first (only for demo mode, not user documents)
+    if (!documentId) {
+      const cached = await QueryCache.get(query, {
+        cacheType: 'demo',
+        mode,
+        documentId,
+        intent: cacheIntent,
+      });
+      if (cached) {
+        console.log(`[Perception] Cache hit in ${performance.now() - start}ms`);
+        return {
+          text: cached.response,
+          source: 'cache',
+          confidence: 1.0,
+          canRefine: false
+        };
+      }
+
+      // 1. Check DEMO PERFECT QUERIES next
+      const perfectMatch = this.findPerfectQuery(normalizedQuery);
+      if (perfectMatch) {
+        await QueryCache.save(query, perfectMatch, [], {
+          cacheType: 'demo',
+          mode,
+          documentId,
+          intent: cacheIntent,
+        });
+        console.log(`[Perception] Perfect demo query match in ${performance.now() - start}ms`);
+        return {
+          text: perfectMatch,
+          source: 'demo',
+          confidence: 1.0,
+          canRefine: false
+        };
+      }
+
+      // 2. Check demo responses (pre-computed)
+      const demoResp = getDemoResponse(query);
+      if (demoResp) {
+        await QueryCache.save(query, demoResp, [], {
+          cacheType: 'demo',
+          mode,
+          documentId,
+          intent: cacheIntent,
+        });
+        console.log(`[Perception] Demo response in ${performance.now() - start}ms`);
+        return {
+          text: demoResp,
+          source: 'demo',
+          confidence: 0.95,
+          canRefine: false
+        };
+      }
     }
 
-    // 1. Check query cache (fastest)
-    const cached = await QueryCache.get(query, mode, documentId);
-    if (cached) {
-      console.log(`[Perception] Cache hit in ${performance.now() - start}ms`);
-      return {
-        text: cached.response,
-        source: 'cache',
-        confidence: 1.0,
-        canRefine: false
-      };
-    }
-
-    // 2. Check demo responses (pre-computed)
-    const demoResp = getDemoResponse(query);
-    if (demoResp) {
-      console.log(`[Perception] Demo response in ${performance.now() - start}ms`);
-      return {
-        text: demoResp,
-        source: 'demo',
-        confidence: 0.95,
-        canRefine: false
-      };
-    }
-
-    // 3. Intent-based heuristic response
-    const intent = this.detectIntent(query);
-    if (intent && PRECOMPUTED_RESPONSES[intent]) {
-      console.log(`[Perception] Intent match (${intent}) in ${performance.now() - start}ms`);
-      return {
-        text: PRECOMPUTED_RESPONSES[intent],
-        source: 'heuristic',
-        confidence: 0.85,
-        canRefine: true
-      };
-    }
-
-    // 4. Extract from document (ultra-fast fallback)
+    // 3. For documents: Always extract fresh content from document (skip heuristic cache)
     if (documentId || documentText) {
       const excerpt = await this.extractSmartExcerpt(query, documentId, documentText);
       if (excerpt) {
@@ -352,6 +360,40 @@ class PerceptionEngineClass {
           canRefine: true
         };
       }
+    }
+
+    // 4. Fallback: Intent-based heuristic response (only when no document)
+    const heuristicCached = await QueryCache.get(query, {
+      cacheType: 'heuristic',
+      mode,
+      documentId,
+      intent: cacheIntent,
+    });
+    if (heuristicCached) {
+      console.log(`[Perception] Heuristic cache hit (${cacheIntent}) in ${performance.now() - start}ms`);
+      return {
+        text: heuristicCached.response,
+        source: 'cache',
+        confidence: 0.85,
+        canRefine: false
+      };
+    }
+
+    const intent = this.detectIntent(query);
+    if (intent && PRECOMPUTED_RESPONSES[intent]) {
+      await QueryCache.save(query, PRECOMPUTED_RESPONSES[intent], [], {
+        cacheType: 'heuristic',
+        mode,
+        documentId,
+        intent: cacheIntent,
+      });
+      console.log(`[Perception] Intent match (${intent}) in ${performance.now() - start}ms`);
+      return {
+        text: PRECOMPUTED_RESPONSES[intent],
+        source: 'heuristic',
+        confidence: 0.85,
+        canRefine: true
+      };
     }
 
     // 5. Generate skeleton response (absolute fallback)
@@ -402,6 +444,7 @@ class PerceptionEngineClass {
 
   /**
    * Extract relevant excerpt from document - FAST (<50ms)
+   * Returns varied results by searching with query and selecting diverse chunks
    */
   private async extractSmartExcerpt(
     query: string,
@@ -409,44 +452,68 @@ class PerceptionEngineClass {
     documentText?: string
   ): Promise<string | null> {
     try {
-      let rawSentences: string[] = [];
+      let allResults: Array<{ snippet: string; score: number }> = [];
 
-      // Try keyword search first (instant)
+      // Try keyword search first (instant) - get more results for variety
       if (documentId) {
-        const results = DocumentStore.searchDocumentByKeyword(documentId, query, 2);
-        if (results.length > 0) {
-          const snippets = results.map(r => r.snippet).join(' ');
-          rawSentences = snippets.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 20);
-        }
+        const results = DocumentStore.searchDocumentByKeyword(documentId, query, 3);
+        allResults = results;
       }
 
-      // Fallback to document text
-      if (rawSentences.length === 0 && documentText) {
-        const topText = this.extractTopSentences(documentText, query, 4);
+      // Fallback to document text if no results
+      if (allResults.length === 0 && documentText) {
+        const topText = this.extractTopSentences(documentText, query, 8);
         if (topText) {
-          rawSentences = topText.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 20);
+          allResults = topText.split(/[.!?]+/).map(s => ({
+            snippet: s.trim(),
+            score: 1
+          })).filter(r => r.snippet.length > 20);
         }
       }
 
-      if (rawSentences.length === 0) return null;
+      if (allResults.length === 0) return null;
 
-      // Deduplicate and compress to bullet points
+      // Select diverse chunks: take high-scoring ones but vary selection
+      // This ensures different queries get different content even with same intent
+      const selected: string[] = [];
       const seen = new Set<string>();
-      const bullets: string[] = [];
-      for (const s of rawSentences) {
-        const key = s.toLowerCase().split(/\s+/).slice(0, 5).join(' ');
-        if (!seen.has(key)) {
-          seen.add(key);
-          const words = s.split(/\s+/);
-          let shortened = words.length > 25 ? words.slice(0, 25).join(' ') + '...' : s;
-          shortened = shortened.charAt(0).toUpperCase() + shortened.slice(1);
-          if (!shortened.match(/[.!?]$/)) shortened += '.';
-          bullets.push(`• ${shortened}`);
-        }
-        if (bullets.length >= 3) break;
+
+      // Always include top result
+      if (allResults[0]) {
+        selected.push(allResults[0].snippet);
+        seen.add(allResults[0].snippet.toLowerCase().split(/\s+/).slice(0, 5).join(' '));
       }
 
-      return `**Key Insights**\n\nBased on the document, here are the key insights:\n\n${bullets.join('\n')}`;
+      // For remaining slots, pick from rest of results
+      const remaining = allResults.slice(1).filter(r => r.score > 0);
+      if (remaining.length > 0) {
+        // Add more varied results
+        for (let i = 0; i < Math.min(2, remaining.length); i++) {
+          const idx = i < remaining.length ? i : Math.floor(Math.random() * remaining.length);
+          const r = remaining[idx];
+          if (r) {
+            const key = r.snippet.toLowerCase().split(/\s+/).slice(0, 5).join(' ');
+            if (!seen.has(key)) {
+              seen.add(key);
+              selected.push(r.snippet);
+            }
+          }
+        }
+      }
+
+      // Format as bullet points
+      const bullets: string[] = [];
+      for (const s of selected) {
+        if (!s.trim()) continue;
+        const words = s.split(/\s+/);
+        let shortened = words.length > 25 ? words.slice(0, 25).join(' ') + '...' : s;
+        shortened = shortened.charAt(0).toUpperCase() + shortened.slice(1);
+        if (!shortened.match(/[.!?]$/)) shortened += '.';
+        bullets.push(`• ${shortened}`);
+      }
+
+      if (bullets.length === 0) return null;
+      return `**Key Insights**\n\nBased on the document:\n\n${bullets.join('\n')}`;
     } catch (err) {
       console.warn('[Perception] Excerpt extraction failed:', err);
       return null;
@@ -461,7 +528,7 @@ class PerceptionEngineClass {
     if (sentences.length === 0) return null;
 
     const queryWords = new Set(
-      query.toLowerCase().split(/\s+/).filter(w => w.length > 2 && !FILLER_WORDS.has(w))
+      query.toLowerCase().split(/\s+/).filter(w => w.length > 2 && !STOP_WORDS.has(w))
     );
 
     // Score sentences by query word overlap
@@ -500,7 +567,7 @@ class PerceptionEngineClass {
     for (const word of words) {
       const clean = word.toLowerCase().replace(/[^a-z]/g, '');
       // Keep important words
-      if (!FILLER_WORDS.has(clean) || compressed.length === 0) {
+      if (!STOP_WORDS.has(clean) || compressed.length === 0) {
         compressed.push(word);
       }
       if (compressed.join(' ').length >= maxLen) break;

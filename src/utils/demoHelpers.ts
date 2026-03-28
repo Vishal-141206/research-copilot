@@ -1,3 +1,5 @@
+import { detectCacheIntent, normalizeQuery } from './queryCache';
+
 /**
  * Demo Helper Utilities
  *
@@ -200,6 +202,10 @@ export const DEMO_RESPONSES = new Map<string, string>([
   ],
 ]);
 
+const NORMALIZED_DEMO_RESPONSES = new Map<string, string>(
+  Array.from(DEMO_RESPONSES.entries()).map(([key, value]) => [normalizeQuery(key), value]),
+);
+
 export interface DemoConfig {
   enablePreloading: boolean;
   showHints: boolean;
@@ -219,7 +225,27 @@ export const DEFAULT_DEMO_CONFIG: DemoConfig = {
  * ENHANCED: More fuzzy matching to ensure responses for most queries
  */
 export function getDemoResponse(query: string): string | null {
-  const normalized = query.toLowerCase().trim();
+  const normalized = normalizeQuery(query);
+
+  const exact = NORMALIZED_DEMO_RESPONSES.get(normalized);
+  if (exact) {
+    return exact;
+  }
+
+  const intent = detectCacheIntent(normalized);
+  if (intent === 'summary') {
+    return DEMO_RESPONSES.get('summary') || DEMO_RESPONSES.get('summarize') || DEMO_RESPONSES.get('default')!;
+  }
+  if (intent === 'key_points') {
+    return DEMO_RESPONSES.get('key takeaways') || DEMO_RESPONSES.get('main points') || DEMO_RESPONSES.get('default')!;
+  }
+  if (intent === 'process') {
+    return DEMO_RESPONSES.get('how does it work') || DEMO_RESPONSES.get('methodology') || DEMO_RESPONSES.get('default')!;
+  }
+  if (intent === 'benefits') {
+    return DEMO_RESPONSES.get('benefits') || DEMO_RESPONSES.get('advantages') || DEMO_RESPONSES.get('default')!;
+  }
+  return DEMO_RESPONSES.get('default')!;
 
   // Direct match
   if (DEMO_RESPONSES.has(normalized)) {
@@ -502,7 +528,10 @@ export async function injectDemoCache(): Promise<void> {
     const resp = getDemoResponse(q);
     if (resp) {
       for (const mode of modes) {
-        await QueryCache.save(q, resp, [], mode);
+        await QueryCache.save(q, resp, [], {
+          cacheType: 'demo',
+          mode,
+        });
         cached++;
       }
     }

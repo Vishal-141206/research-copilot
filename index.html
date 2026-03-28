@@ -35,8 +35,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Research Copilot" />
   <meta name="mobile-web-app-capable" content="yes" />
-  <meta name="theme-color" content="#0a0a0f" />
-  <meta name="msapplication-TileColor" content="#6366f1" />
+  <meta name="theme-color" content="#09110f" />
+  <meta name="msapplication-TileColor" content="#2cb492" />
   <meta name="msapplication-config" content="/browserconfig.xml" />
 
   <!-- Favicon -->
@@ -53,8 +53,8 @@
   <link rel="preconnect" href="https://huggingface.co" />
 
   <!-- Preload critical fonts -->
-  <link rel="preload" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" as="style" onload="this.onload=null;this.rel='stylesheet'" />
-  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" /></noscript>
+  <link rel="preload" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@400;500;700&display=swap" as="style" onload="this.onload=null;this.rel='stylesheet'" />
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@400;500;700&display=swap" /></noscript>
 
   <!-- Critical CSS for initial load -->
   <style>
@@ -72,8 +72,10 @@
     }
 
     body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-      background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+      font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background:
+        radial-gradient(circle at top, rgba(44, 180, 146, 0.14) 0%, transparent 30%),
+        linear-gradient(180deg, #09110f 0%, #060808 100%);
       color: #ffffff;
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
@@ -91,8 +93,8 @@
       content: '';
       width: 48px;
       height: 48px;
-      border: 3px solid rgba(99, 102, 241, 0.2);
-      border-top-color: #6366f1;
+      border: 3px solid rgba(44, 180, 146, 0.2);
+      border-top-color: #2cb492;
       border-radius: 50%;
       animation: spin 1s linear infinite;
     }
@@ -122,7 +124,7 @@
 
     /* Selection styling */
     ::selection {
-      background: rgba(99, 102, 241, 0.3);
+      background: rgba(44, 180, 146, 0.3);
       color: #fff;
     }
   </style>
@@ -139,7 +141,9 @@
       align-items: center;
       justify-content: center;
       height: 100vh;
-      background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+      background:
+        radial-gradient(circle at top, rgba(44, 180, 146, 0.14) 0%, transparent 30%),
+        linear-gradient(180deg, #09110f 0%, #060808 100%);
       color: #fff;
       font-family: -apple-system, BlinkMacSystemFont, sans-serif;
       text-align: center;
@@ -148,7 +152,7 @@
       <div style="
         width: 80px;
         height: 80px;
-        background: linear-gradient(135deg, #6366f1, #a855f7);
+        background: linear-gradient(145deg, #2cb492, #ffb04e);
         border-radius: 20px;
         display: flex;
         align-items: center;

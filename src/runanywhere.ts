@@ -1,29 +1,10 @@
-/**
- * RunAnywhere SDK initialization and model catalog.
- *
- * OPTIMIZED FOR HACKATHON:
- * - Force WebGPU acceleration where available
- * - Performance logging for debugging
- * - Model warmup for consistent latency
- */
-
 import {
   RunAnywhere,
   SDKEnvironment,
-  ModelManager,
   ModelCategory,
   LLMFramework,
   type CompactModelDef,
 } from '@runanywhere/web';
-
-import { LlamaCPP, VLMWorkerBridge } from '@runanywhere/web-llamacpp';
-import { ONNX } from '@runanywhere/web-onnx';
-
-// VLM worker removed in current codebase.
-
-// ---------------------------------------------------------------------------
-// Performance Logging
-// ---------------------------------------------------------------------------
 
 const perfLog = (label: string, startTime?: number) => {
   if (startTime) {
@@ -33,53 +14,13 @@ const perfLog = (label: string, startTime?: number) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// WebGPU Detection (with type safety)
-// ---------------------------------------------------------------------------
-
 interface GPUAdapterInfo {
   vendor?: string;
   architecture?: string;
   device?: string;
 }
 
-export async function checkWebGPUSupport(): Promise<{ supported: boolean; info: GPUAdapterInfo | null }> {
-  try {
-    // @ts-ignore - WebGPU types not in standard lib
-    const gpu = navigator.gpu;
-    if (!gpu) {
-      console.warn('[GPU] WebGPU not available in this browser');
-      return { supported: false, info: null };
-    }
-
-    // @ts-ignore - WebGPU types
-    const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
-    if (!adapter) {
-      console.warn('[GPU] No WebGPU adapter found');
-      return { supported: false, info: null };
-    }
-
-    // @ts-ignore - WebGPU types
-    const info: GPUAdapterInfo = await adapter.requestAdapterInfo?.() || {};
-    console.log('[GPU] WebGPU Adapter:', {
-      vendor: info.vendor || 'unknown',
-      architecture: info.architecture || 'unknown',
-      device: info.device || 'unknown',
-    });
-
-    return { supported: true, info };
-  } catch (e) {
-    console.warn('[GPU] WebGPU check failed:', e);
-    return { supported: false, info: null };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Model catalog
-// ---------------------------------------------------------------------------
-
-const MODELS: CompactModelDef[] = [
-  // LLM — Liquid AI LFM2 350M (small + fast for chat)
+const LANGUAGE_MODELS: CompactModelDef[] = [
   {
     id: 'lfm2-350m-q4_k_m',
     name: 'LFM2 350M Q4_K_M',
@@ -89,27 +30,9 @@ const MODELS: CompactModelDef[] = [
     modality: ModelCategory.Language,
     memoryRequirement: 250_000_000,
   },
-  // LLM — Liquid AI LFM2 1.2B Tool (optimized for tool calling & function calling)
-  {
-    id: 'lfm2-1.2b-tool-q4_k_m',
-    name: 'LFM2 1.2B Tool Q4_K_M',
-    repo: 'LiquidAI/LFM2-1.2B-Tool-GGUF',
-    files: ['LFM2-1.2B-Tool-Q4_K_M.gguf'],
-    framework: LLMFramework.LlamaCpp,
-    modality: ModelCategory.Language,
-    memoryRequirement: 800_000_000,
-  },
-  // VLM — Liquid AI LFM2-VL 450M (vision + language)
-  {
-    id: 'lfm2-vl-450m-q4_0',
-    name: 'LFM2-VL 450M Q4_0',
-    repo: 'runanywhere/LFM2-VL-450M-GGUF',
-    files: ['LFM2-VL-450M-Q4_0.gguf', 'mmproj-LFM2-VL-450M-Q8_0.gguf'],
-    framework: LLMFramework.LlamaCpp,
-    modality: ModelCategory.Multimodal,
-    memoryRequirement: 500_000_000,
-  },
-  // STT (sherpa-onnx archive)
+];
+
+const SPEECH_MODELS: CompactModelDef[] = [
   {
     id: 'sherpa-onnx-whisper-tiny.en',
     name: 'Whisper Tiny English (ONNX)',
@@ -119,7 +42,6 @@ const MODELS: CompactModelDef[] = [
     memoryRequirement: 105_000_000,
     artifactType: 'archive' as const,
   },
-  // TTS (sherpa-onnx archive)
   {
     id: 'vits-piper-en_US-lessac-medium',
     name: 'Piper TTS US English (Lessac)',
@@ -129,7 +51,6 @@ const MODELS: CompactModelDef[] = [
     memoryRequirement: 65_000_000,
     artifactType: 'archive' as const,
   },
-  // VAD (single ONNX file)
   {
     id: 'silero-vad-v5',
     name: 'Silero VAD v5',
@@ -141,84 +62,164 @@ const MODELS: CompactModelDef[] = [
   },
 ];
 
-// ---------------------------------------------------------------------------
-// Initialization
-// ---------------------------------------------------------------------------
+let coreInitPromise: Promise<void> | null = null;
+let llamaReadyPromise: Promise<void> | null = null;
+let onnxReadyPromise: Promise<void> | null = null;
+let llamaModulePromise: Promise<typeof import('@runanywhere/web-llamacpp')> | null = null;
+let onnxModulePromise: Promise<typeof import('@runanywhere/web-onnx')> | null = null;
+let webgpuSupported = false;
+let accelerationMode: string | null = null;
+let languageModelsRegistered = false;
+let speechModelsRegistered = false;
 
-let _initPromise: Promise<void> | null = null;
-let _webgpuSupported = false;
-let _accelerationMode: string | null = null;
+function registerLanguageModels() {
+  if (languageModelsRegistered) return;
+  RunAnywhere.registerModels(LANGUAGE_MODELS);
+  languageModelsRegistered = true;
+}
 
-/** Initialize the RunAnywhere SDK. Safe to call multiple times. */
-export async function initSDK(): Promise<void> {
-  if (_initPromise) return _initPromise;
+function registerSpeechModels() {
+  if (speechModelsRegistered) return;
+  RunAnywhere.registerModels(SPEECH_MODELS);
+  speechModelsRegistered = true;
+}
 
-  _initPromise = (async () => {
-    const initStart = Date.now();
-    perfLog('SDK initialization started');
+function loadLlamaModule() {
+  if (!llamaModulePromise) {
+    llamaModulePromise = import('@runanywhere/web-llamacpp');
+  }
+  return llamaModulePromise;
+}
 
-    // Step 0: Check WebGPU support FIRST
-    const gpuCheck = await checkWebGPUSupport();
-    _webgpuSupported = gpuCheck.supported;
-    perfLog(`WebGPU check complete (supported: ${_webgpuSupported})`, initStart);
+function loadOnnxModule() {
+  if (!onnxModulePromise) {
+    onnxModulePromise = import('@runanywhere/web-onnx');
+  }
+  return onnxModulePromise;
+}
 
-    // Step 1: Initialize core SDK (TypeScript-only, no WASM)
-    const coreStart = Date.now();
-    await RunAnywhere.initialize({
-      environment: SDKEnvironment.Development,
-      debug: true,
-    });
-    perfLog('Core SDK initialized', coreStart);
-
-    // Step 2: Register backends (loads WASM automatically)
-    const llamaStart = Date.now();
-    await LlamaCPP.register();
-    _accelerationMode = LlamaCPP.accelerationMode;
-    perfLog(`LlamaCPP registered (mode: ${_accelerationMode})`, llamaStart);
-
-    // Log acceleration mode prominently
-    console.log('========================================');
-    console.log(`[RUNTIME] Acceleration Mode: ${_accelerationMode}`);
-    console.log(`[RUNTIME] WebGPU Available: ${_webgpuSupported}`);
-    if (_accelerationMode === 'webgpu') {
-      console.log('[RUNTIME] ✅ Using WebGPU - FAST mode');
-    } else if (_accelerationMode === 'simd') {
-      console.log('[RUNTIME] ⚠️ Using SIMD CPU - Moderate speed');
-    } else {
-      console.log('[RUNTIME] ❌ Using basic CPU - SLOW mode');
+export async function checkWebGPUSupport(): Promise<{ supported: boolean; info: GPUAdapterInfo | null }> {
+  try {
+    // @ts-ignore
+    const gpu = navigator.gpu;
+    if (!gpu) {
+      return { supported: false, info: null };
     }
-    console.log('========================================');
 
-    const onnxStart = Date.now();
-    await ONNX.register();
-    perfLog('ONNX registered', onnxStart);
+    // @ts-ignore
+    const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) {
+      return { supported: false, info: null };
+    }
 
-    // Step 3: Register model catalog
-    RunAnywhere.registerModels(MODELS);
-    perfLog('Models registered');
+    // @ts-ignore
+    const info: GPUAdapterInfo = (await adapter.requestAdapterInfo?.()) || {};
+    return { supported: true, info };
+  } catch (error) {
+    console.warn('[GPU] WebGPU check failed:', error);
+    return { supported: false, info: null };
+  }
+}
 
-    // Step 4: VLM worker setup intentionally disabled.
+export async function initSDK(): Promise<void> {
+  if (coreInitPromise) return coreInitPromise;
 
-    perfLog('SDK initialization complete', initStart);
+  coreInitPromise = (async () => {
+    const initStart = Date.now();
+    perfLog('SDK core initialization started');
+
+    const [gpuCheck] = await Promise.all([
+      checkWebGPUSupport(),
+      RunAnywhere.initialize({
+        environment: SDKEnvironment.Production,
+        debug: false,
+      }),
+    ]);
+
+    webgpuSupported = gpuCheck.supported;
+    registerLanguageModels();
+
+    console.log('[RUNTIME] Core ready', {
+      webgpuSupported,
+      adapter: gpuCheck.info || 'unknown',
+    });
+
+    perfLog('SDK core initialized', initStart);
   })();
 
-  return _initPromise;
+  return coreInitPromise;
 }
 
-/** Get acceleration mode after init. */
+export async function ensureLLMRuntime(): Promise<void> {
+  if (llamaReadyPromise) return llamaReadyPromise;
+
+  llamaReadyPromise = (async () => {
+    await initSDK();
+
+    const llamaStart = Date.now();
+    const { LlamaCPP } = await loadLlamaModule();
+    await LlamaCPP.register();
+    accelerationMode = LlamaCPP.accelerationMode;
+
+    console.log('[RUNTIME] LLM backend ready', {
+      accelerationMode,
+      webgpuSupported,
+    });
+
+    perfLog('LlamaCPP registered', llamaStart);
+  })();
+
+  return llamaReadyPromise;
+}
+
+export async function ensureSpeechRuntime(): Promise<void> {
+  if (onnxReadyPromise) return onnxReadyPromise;
+
+  onnxReadyPromise = (async () => {
+    await initSDK();
+    registerSpeechModels();
+
+    const onnxStart = Date.now();
+    const { ONNX } = await loadOnnxModule();
+    await ONNX.register();
+    perfLog('ONNX registered', onnxStart);
+  })();
+
+  return onnxReadyPromise;
+}
+
+export async function getTextGenerationApi() {
+  await ensureLLMRuntime();
+  const { TextGeneration } = await loadLlamaModule();
+  return TextGeneration;
+}
+
+export async function getSTTApi() {
+  await ensureSpeechRuntime();
+  const { STT } = await loadOnnxModule();
+  return STT;
+}
+
+export function primeSDK() {
+  const startPrime = () => {
+    initSDK().catch((error) => console.warn('[RUNTIME] Core warmup skipped:', error));
+  };
+
+  if ('requestIdleCallback' in window) {
+    window.requestIdleCallback(() => startPrime(), { timeout: 1500 });
+  } else {
+    setTimeout(startPrime, 300);
+  }
+}
+
 export function getAccelerationMode(): string | null {
-  return _accelerationMode;
+  return accelerationMode;
 }
 
-/** Check if WebGPU is being used */
 export function isUsingWebGPU(): boolean {
-  return _accelerationMode === 'webgpu';
+  return accelerationMode === 'webgpu';
 }
 
-/** Check if WebGPU is supported */
 export function isWebGPUSupported(): boolean {
-  return _webgpuSupported;
+  return webgpuSupported;
 }
-
-// Re-export for convenience
-export { RunAnywhere, ModelManager, ModelCategory, VLMWorkerBridge };
