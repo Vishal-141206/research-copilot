@@ -550,14 +550,13 @@ export function HackathonWinner() {
       ? DocumentAnalyzer.generateResponse(documentAnalysis, query, pdfName || 'Document')
       : '';
     const extractionFallback = generateTextExtractionFallback(currentDocument?.text || '', query, pdfName || 'Document');
-    const fallback = extractionFallback;
     const retrievalMode = _retrievalMode;
+    const cleanedContext = (retrievedContext || '').trim();
 
-    if (!retrievedContext) {
-      return buildStructuredAnswer(query, analysisResponse, extractionFallback);
+    const structuredFallback = buildStructuredAnswer(query, cleanedContext || analysisResponse, extractionFallback);
+    if (!cleanedContext) {
+      return structuredFallback;
     }
-
-    return buildStructuredAnswer(query, retrievedContext, analysisResponse, extractionFallback);
 
     const queryTerms = query
       .toLowerCase()
@@ -565,7 +564,7 @@ export function HackathonWinner() {
       .map((term) => term.replace(/[^a-z0-9]/g, ''))
       .filter((term) => term.length >= 3);
 
-    const evidenceLines = retrievedContext
+    const evidenceLines = cleanedContext
       .split(/\n\n/)
       .flatMap((chunk) => {
         const cleanedChunk = chunk
@@ -594,12 +593,18 @@ export function HackathonWinner() {
       .filter((sentence, index, arr) => arr.indexOf(sentence) === index)
       .slice(0, 3);
 
-    const primary = evidenceLines[0] || fallback;
-    const secondary = evidenceLines[1] || 'The retrieved context supports the same conclusion in another section of the document.';
+    if (evidenceLines.length === 0) {
+      return structuredFallback;
+    }
+
+    const primary = evidenceLines[0];
+    const secondary = evidenceLines[1] || analysisResponse || extractionFallback || primary;
     const tertiary = evidenceLines[2] || secondary;
     const sourceLabel = retrievalMode === 'semantic'
       ? 'Semantic retrieval match from your document.'
-      : 'Keyword retrieval match from your document.';
+      : retrievalMode === 'keyword'
+        ? 'Keyword retrieval match from your document.'
+        : 'Retrieved context from your document.';
 
     if (explainMode === 'simple') {
       return `**Answer**\n\n${primary}\n\n_${sourceLabel}_`;
@@ -610,20 +615,6 @@ export function HackathonWinner() {
     }
 
     return `**Answer**\n\n${primary}\n\n**Supporting Points**\n\n- ${secondary}\n- ${tertiary}\n\n_${sourceLabel}_`;
-
-    const bullets = retrievedContext
-      .split(/\n\n/)
-      .slice(0, 2)
-      .map((chunk) => {
-        const cleaned = chunk.replace(/^\[\d+\]\s*/, '').trim();
-        const firstSentence = cleaned.split(/[.!?]+/).find((sentence) => sentence.trim().length > 30)?.trim() || cleaned;
-        return firstSentence.slice(0, 160).trim();
-      })
-      .filter(Boolean)
-      .map((chunk) => `• ${chunk}${chunk.endsWith('.') ? '' : '.'}`)
-      .join('\n');
-
-    return fallback;
   }, [currentDocument?.text, documentAnalysis, explainMode, pdfName]);
 
   // -------------------------------------------------------------------------
@@ -3221,4 +3212,3 @@ const globalCSS = `
 `;
 
 export default HackathonWinner;
-
